@@ -44,8 +44,10 @@ excel_test_outputs/
 *.xls
 *.pdf
 dist/
+dist_package/*.exe
 build/
 *.spec
+build_output.txt
 
 # Allow committed dummy/sanitized fixtures only under tests/fixtures
 !tests/
