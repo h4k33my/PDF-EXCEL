@@ -1,0 +1,24 @@
+{
+  "fixture_name": "dummy_statement",
+  "notes": "Replace this with expected output for a sanitized sample PDF.",
+  "expected_header": [
+    "Transaction Date",
+    "Transaction Details",
+    "Reference",
+    "Value Date",
+    "Debit Amount",
+    "Credit Amount",
+    "Current Balance"
+  ],
+  "expected_rows": [
+    [
+      "01/01/2026",
+      "DUMMY TRANSACTION",
+      "REF123456",
+      "01/01/2026",
+      "",
+      "100.00",
+      "100.00"
+    ]
+  ]
+}
