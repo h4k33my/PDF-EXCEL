@@ -1,0 +1,7 @@
+Put dummy or sanitized PDF fixtures in this folder.
+
+Examples:
+- uba_dummy_statement.pdf
+- access_dummy_statement.pdf
+
+These files should be safe to commit and should never contain real customer data.

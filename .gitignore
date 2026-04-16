@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.lnk
+
+# Application specific
+test_excel_outputs/
+excel_test_outputs/
+*.xlsx
+*.xls
+*.pdf
+dist/
+build/
+*.spec
+
+# Allow committed dummy/sanitized fixtures only under tests/fixtures
+!tests/
+!tests/fixtures/
+!tests/fixtures/**/*.md
+!tests/fixtures/**/*.txt
+!tests/fixtures/**/*.json
+!tests/fixtures/**/*.pdf
