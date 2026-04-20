@@ -48,6 +48,15 @@
    - Status bar will show "✓ Excel file saved successfully"
    - Your Excel file is ready!
 
+6. **Optional: Update an Existing Excel File**
+   - Click `Update Existing Excel…` (next to `Convert & Save`)
+   - Choose an existing `.xlsx` file
+   - Pick one mode:
+     - **Add selected app sheets as new sheet(s)**
+     - **Paste into existing sheet** (from highlighted cells or full active sheet)
+   - For paste mode, choose destination sheet and start cell (for example `A2500`)
+   - Confirm overwrite prompt if destination cells already have values
+
 ### Step 4: Use Your Excel File
 - Open the saved Excel file in Microsoft Excel
 - You'll see multiple sheets (tabs at bottom)
@@ -67,6 +76,9 @@ A: Currently Windows only. Contact IT if you need Mac version.
 
 **Q: What if I only want certain data?**  
 A: You can edit the in-app preview first (rename/delete/insert/sort/reorder), or export to Excel and edit there.
+
+**Q: Will updating an existing workbook break formatting?**  
+A: No. The app writes values only, so destination formatting/layout (colors, borders, widths, frozen panes) is preserved.
 
 **Q: Is my bank data safe?**  
 A: Yes! Everything stays on your computer. No data goes to the internet.

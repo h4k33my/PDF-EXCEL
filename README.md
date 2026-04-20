@@ -8,6 +8,7 @@ A lightweight desktop application that extracts all data from bank statement PDF
 - **Interactive Preview**: View extracted data before saving
 - **In-app editing**: Rename sheets, insert/delete rows/columns, sort columns, and reorder rows/columns in the preview
 - **Selective Export**: Choose which sheets to include in the final Excel file
+- **Update Existing Workbook**: Add app sheets into an existing `.xlsx` or paste selected cells/full active sheet into a target sheet at a chosen start cell
 - **Professional Formatting**: Auto-formatted Excel output with proper headers and column widths
 - **No Installation Required**: Standalone `.exe` for Windows (no Python needed)
 
@@ -29,6 +30,7 @@ A lightweight desktop application that extracts all data from bank statement PDF
 6. **(Optional) Edit Preview**: Right-click and use the preview tools to rename/sort/insert/delete/reorder
 7. **Save as Excel**: Specify output filename and location
 8. **Convert & Save**: Click the button to generate Excel file
+9. **(Optional) Update Existing Excel**: Click `Update Existing Excel…` to write values into an existing workbook without changing destination formatting styles
 
 ### For Developers (Source Code)
 
@@ -110,6 +112,14 @@ BankStatementConverter/
 - Change location and filename as needed
 - Will create `.xlsx` extension automatically if not provided
 
+### Update Existing Excel (value-only writes)
+- Use `Update Existing Excel…` to merge app results into an existing workbook.
+- Two modes:
+  - **Add selected app sheets as new sheet(s)** in destination workbook
+  - **Paste into existing sheet** from highlighted cells (active sheet) or full active sheet, at a start cell like `A2500`
+- Destination workbook formatting is preserved (row/column sizes, colors, borders, frozen panes, etc.).
+- Only destination **cell values** in the targeted range are changed.
+
 ## Troubleshooting
 
 ### "Error extracting PDF"
@@ -149,6 +159,7 @@ For issues or feature requests, contact the development team or review the appli
 - Sheet tabs can be renamed/duplicated/inserted/deleted from the app
 - Cash flow mapping `Done` classifies inflow/outflow and checks totals but does not auto-save
 - Improved header detection and safer extraction for weak-border statements
+- Added `Update Existing Excel…` workflow for appending sheets or pasting selected ranges/full active sheet into existing workbooks with value-only writes
 
 ### v1.0 (Initial Release)
 - Extract all tables from bank statement PDFs

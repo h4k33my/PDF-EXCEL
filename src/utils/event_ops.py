@@ -60,6 +60,7 @@ def apply_event_amount_mapping(
     amount_col_idx: int,
     event_col_idx: int,
     options: Iterable[str],
+    row_event_keys: Dict[int, str] | None = None,
 ) -> Tuple[List[List[object]], Dict[str, int], List[str]]:
     """
     For each row, write amount into the column whose header matches selected event.
@@ -73,12 +74,26 @@ def apply_event_amount_mapping(
     rows_updated = 0
     rows_skipped = 0
     events_missing = 0
+    destination_indices = list(header_map.values())
     for row_idx in range(1, len(out)):
         row = out[row_idx]
         if event_col_idx >= len(row) or amount_col_idx >= len(row):
             rows_skipped += 1
             continue
-        event_value = str(row[event_col_idx] or "").strip()
+        # Keep exactly one mapped destination per row among mapping headers.
+        for dest_col in destination_indices:
+            while len(row) <= dest_col:
+                row.append("")
+            row[dest_col] = ""
+
+        event_value = ""
+        if row_event_keys is not None:
+            event_value = str(row_event_keys.get(row_idx, "") or "").strip()
+        text_value = str(row[event_col_idx] or "").strip()
+        if not event_value:
+            text_key = normalize_header(text_value) if text_value else ""
+            if text_key in header_map:
+                event_value = text_value
         if not event_value:
             rows_skipped += 1
             continue

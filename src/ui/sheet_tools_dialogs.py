@@ -17,8 +17,12 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QAbstractItemView,
     QDialogButtonBox,
+    QLineEdit,
+    QFileDialog,
+    QRadioButton,
 )
 from PyQt6.QtGui import QColor
+from openpyxl import load_workbook
 
 
 class ImportColumnsDialog(QDialog):
@@ -261,3 +265,121 @@ class EventColumnModeDialog(QDialog):
 
     def choice(self) -> Optional[Literal["create", "existing"]]:
         return self._choice
+
+
+class UpdateExistingExcelDialog(QDialog):
+    """Configure update mode for writing into an existing workbook."""
+
+    def __init__(self, parent, *, active_sheet_name: str, has_selection: bool):
+        super().__init__(parent)
+        self.setWindowTitle("Update existing Excel workbook")
+        self._result = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Destination workbook (.xlsx):"))
+        path_row = QHBoxLayout()
+        self._path_edit = QLineEdit()
+        self._path_edit.setPlaceholderText("Choose existing workbook")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse_workbook)
+        path_row.addWidget(self._path_edit, 1)
+        path_row.addWidget(browse_btn)
+        layout.addLayout(path_row)
+
+        layout.addWidget(QLabel("Operation:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Add selected app sheets as new sheet(s)", "add_sheets")
+        self._mode_combo.addItem("Paste into existing sheet", "paste_range")
+        self._mode_combo.currentIndexChanged.connect(self._sync_visibility)
+        layout.addWidget(self._mode_combo)
+
+        self._paste_block = QVBoxLayout()
+        self._sheet_combo = QComboBox()
+        self._start_cell_edit = QLineEdit("A1")
+        self._start_cell_edit.setPlaceholderText("A1")
+        self._source_combo = QComboBox()
+        if has_selection:
+            self._source_combo.addItem("Use highlighted cells on active sheet", "selection")
+        self._source_combo.addItem(f"Use full active sheet ({active_sheet_name})", "full_active")
+        self._paste_block.addWidget(QLabel("Destination sheet:"))
+        self._paste_block.addWidget(self._sheet_combo)
+        self._paste_block.addWidget(QLabel("Start cell (e.g. A2500):"))
+        self._paste_block.addWidget(self._start_cell_edit)
+        self._paste_block.addWidget(QLabel("Source to paste:"))
+        self._paste_block.addWidget(self._source_combo)
+        layout.addLayout(self._paste_block)
+
+        self._clear_first = QRadioButton("Clear destination rectangle first, then paste values")
+        self._clear_first.setChecked(False)
+        layout.addWidget(self._clear_first)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_ok)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(640, 320)
+        self._sync_visibility()
+
+    def _sync_visibility(self):
+        paste_mode = self._mode_combo.currentData() == "paste_range"
+        for i in range(self._paste_block.count()):
+            item = self._paste_block.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                w.setVisible(paste_mode)
+        self._clear_first.setVisible(paste_mode)
+
+    def _browse_workbook(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select destination workbook", "", "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+        self._path_edit.setText(path)
+        self._reload_sheet_names(path)
+
+    def _reload_sheet_names(self, path: str):
+        self._sheet_combo.clear()
+        try:
+            wb = load_workbook(path, read_only=True)
+            for name in wb.sheetnames:
+                self._sheet_combo.addItem(name, name)
+            wb.close()
+        except Exception:
+            self._sheet_combo.clear()
+
+    def _accept_ok(self):
+        path = str(self._path_edit.text() or "").strip()
+        if not path:
+            QMessageBox.warning(self, "Update workbook", "Choose a destination workbook.")
+            return
+        mode = self._mode_combo.currentData()
+        if mode == "paste_range":
+            if self._sheet_combo.count() == 0:
+                QMessageBox.warning(self, "Update workbook", "No destination sheets found in workbook.")
+                return
+            sheet_name = self._sheet_combo.currentData()
+            start_cell = str(self._start_cell_edit.text() or "").strip().upper()
+            if not start_cell or not any(ch.isdigit() for ch in start_cell):
+                QMessageBox.warning(self, "Update workbook", "Enter a valid start cell like A1.")
+                return
+            source_mode = self._source_combo.currentData()
+            self._result = {
+                "path": path,
+                "mode": mode,
+                "sheet_name": sheet_name,
+                "start_cell": start_cell,
+                "source_mode": source_mode,
+                "clear_first": bool(self._clear_first.isChecked()),
+            }
+        else:
+            self._result = {
+                "path": path,
+                "mode": mode,
+            }
+        self.accept()
+
+    def result(self) -> Optional[dict]:
+        return self._result

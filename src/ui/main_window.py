@@ -38,11 +38,13 @@ from ui.sheet_tools_dialogs import (
     SheetSelectionDialog,
     ColumnSelectionDialog,
     EventColumnModeDialog,
+    UpdateExistingExcelDialog,
 )
 from utils.sheet_ops import filter_rows_by_positive_primary, validate_numeric_primary_column
 from utils.event_ops import (
     apply_event_amount_mapping,
     clone_grid,
+    normalize_header,
     summarize_totals_for_headers,
 )
 
@@ -65,6 +67,71 @@ class ConversionWorker(QThread):
             self.finished.emit(sheets_data)
         except Exception as e:
             self.error.emit(f"Error extracting PDF: {str(e)}")
+
+
+class EventCellWidget(QWidget):
+    """Compact event editor: text field + small dropdown in the corner."""
+
+    textCommitted = pyqtSignal(str)
+    optionPicked = pyqtSignal(str)
+
+    def __init__(self, options: list[str], text: str, selected_key: str, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+        self.text_input = QLineEdit(self)
+        self.text_input.setFrame(False)
+        self.text_input.setStyleSheet("QLineEdit { padding: 0 2px; }")
+        self.text_input.setText(str(text or ""))
+        self.text_input.editingFinished.connect(self._emit_text_committed)
+        self.combo = QComboBox(self)
+        self.combo.setFixedWidth(22)
+        self.combo.setMaximumHeight(20)
+        self.combo.setMaxVisibleItems(18)
+        self.combo.setStyleSheet("QComboBox { padding: 0px; }")
+        self.combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.combo.addItem("")
+        for option in options:
+            self.combo.addItem(option)
+        self.combo.setCurrentText(selected_key if selected_key in options else "")
+        self._ensure_popup_width()
+        self.combo.currentTextChanged.connect(self._emit_option_picked)
+        self.setToolTip("Type custom text, or pick mapping item from the corner dropdown.")
+        self.combo.setToolTip("Mapping key")
+        layout.addWidget(self.text_input, 1)
+        layout.addWidget(self.combo, 0)
+
+    def _emit_text_committed(self):
+        self.textCommitted.emit(self.text_input.text())
+
+    def _emit_option_picked(self, text: str):
+        self.optionPicked.emit(text)
+
+    def sync_state(self, options: list[str], text: str, selected_key: str, combo_enabled: bool):
+        if self.text_input.text() != str(text or ""):
+            self.text_input.setText(str(text or ""))
+        self.combo.blockSignals(True)
+        try:
+            existing = [self.combo.itemText(i) for i in range(self.combo.count())]
+            wanted = [""] + list(options)
+            if existing != wanted:
+                self.combo.clear()
+                for option in wanted:
+                    self.combo.addItem(option)
+                self._ensure_popup_width()
+            wanted_key = selected_key if selected_key in options else ""
+            if self.combo.currentText() != wanted_key:
+                self.combo.setCurrentText(wanted_key)
+            self.combo.setEnabled(combo_enabled)
+        finally:
+            self.combo.blockSignals(False)
+
+    def _ensure_popup_width(self):
+        fm = self.combo.fontMetrics()
+        longest = max((len(self.combo.itemText(i)) for i in range(self.combo.count())), default=0)
+        popup_width = max(180, fm.horizontalAdvance("W" * min(longest + 4, 80)))
+        self.combo.view().setMinimumWidth(popup_width)
 
 
 def _deep_copy_sheets(sheets_data):
@@ -111,6 +178,11 @@ class MainWindow(QMainWindow):
         self.flow_amount_col_idx = None
         self.flow_event_options = []
         self.flow_event_col_idx = None
+        self.flow_working_sheet_name = None
+        self.flow_working_sheet_idx = None
+        self.flow_row_event_keys = {}
+        self.flow_prefilled_event_rows = set()
+        self.flow_unlocked_event_rows = set()
         self.flow_last_output_sheet_name = None
         self.flow_last_output_sheet_data = None
         self.flow_last_output_amount_col_idx = None
@@ -171,12 +243,23 @@ class MainWindow(QMainWindow):
         self.preview_tabs.customContextMenuRequested.connect(self._show_sheet_tab_context_menu)
         self.preview_tabs.tabBarDoubleClicked.connect(self._rename_sheet_from_tab_double_click)
         preview_row.addWidget(self.preview_tabs, stretch=1)
+        side_btn_layout = QVBoxLayout()
+        side_btn_layout.setContentsMargins(0, 0, 0, 0)
+        side_btn_layout.setSpacing(4)
         self._add_sheet_btn = QPushButton("+")
         self._add_sheet_btn.setToolTip("Add blank sheet")
         self._add_sheet_btn.setMinimumWidth(40)
         self._add_sheet_btn.setMaximumWidth(48)
         self._add_sheet_btn.clicked.connect(self.add_blank_sheet)
-        preview_row.addWidget(self._add_sheet_btn, stretch=0)
+        side_btn_layout.addWidget(self._add_sheet_btn)
+        self.mapping_refresh_button = QPushButton("↻")
+        self.mapping_refresh_button.setToolTip("Refresh mapped values")
+        self.mapping_refresh_button.setMinimumWidth(40)
+        self.mapping_refresh_button.setMaximumWidth(48)
+        self.mapping_refresh_button.clicked.connect(self.apply_inflow_outflow_mapping)
+        side_btn_layout.addWidget(self.mapping_refresh_button)
+        side_btn_layout.addStretch()
+        preview_row.addLayout(side_btn_layout, stretch=0)
         top_layout.addLayout(preview_row)
 
         top_panel.setMinimumHeight(self._preview_min_height)
@@ -224,11 +307,12 @@ class MainWindow(QMainWindow):
         self.list_items_button.clicked.connect(self.capture_list_items_from_header_selection)
         self.events_button = QPushButton("Events")
         self.events_button.clicked.connect(self.setup_events_column)
-        self.apply_mapping_button = QPushButton("Apply mapping")
-        self.apply_mapping_button.clicked.connect(self.apply_inflow_outflow_mapping)
         self.done_mapping_button = QPushButton("Done")
         self.done_mapping_button.clicked.connect(self.finish_flow_with_total_check)
-        self.undo_mapping_button = QPushButton("Undo mapping")
+        self.undo_mapping_button = QPushButton("X")
+        self.undo_mapping_button.setToolTip("Remove mapped working sheet")
+        self.undo_mapping_button.setMinimumWidth(34)
+        self.undo_mapping_button.setMaximumWidth(40)
         self.undo_mapping_button.clicked.connect(self.undo_last_flow_output)
         self.flow_status_label = QLabel("Step 1: Start cash flow mapping")
         flow_layout.addWidget(self.start_flow_button)
@@ -236,7 +320,6 @@ class MainWindow(QMainWindow):
         flow_layout.addWidget(self.add_column_button)
         flow_layout.addWidget(self.list_items_button)
         flow_layout.addWidget(self.events_button)
-        flow_layout.addWidget(self.apply_mapping_button)
         flow_layout.addWidget(self.done_mapping_button)
         flow_layout.addWidget(self.undo_mapping_button)
         flow_layout.addWidget(self.flow_status_label)
@@ -277,9 +360,12 @@ class MainWindow(QMainWindow):
             "background-color: #4472C4; color: white; font-weight: bold; padding: 8px;"
         )
         convert_btn.clicked.connect(self.convert_and_save)
+        update_existing_btn = QPushButton("Update Existing Excel…")
+        update_existing_btn.clicked.connect(self.update_existing_excel)
         exit_btn = QPushButton("Exit")
         exit_btn.clicked.connect(self.close)
         button_layout.addStretch()
+        button_layout.addWidget(update_existing_btn)
         button_layout.addWidget(convert_btn)
         button_layout.addWidget(exit_btn)
         bottom_layout.addLayout(button_layout)
@@ -409,6 +495,11 @@ class MainWindow(QMainWindow):
                 "amount_col_idx": self.flow_amount_col_idx,
                 "event_options": list(self.flow_event_options),
                 "event_col_idx": self.flow_event_col_idx,
+                "working_sheet_name": self.flow_working_sheet_name,
+                "working_sheet_idx": self.flow_working_sheet_idx,
+                "row_event_keys": dict(self.flow_row_event_keys),
+                "prefilled_event_rows": sorted(self.flow_prefilled_event_rows),
+                "unlocked_event_rows": sorted(self.flow_unlocked_event_rows),
                 "last_output_sheet_name": self.flow_last_output_sheet_name,
                 "last_output_sheet_data": clone_grid(self.flow_last_output_sheet_data)
                 if self.flow_last_output_sheet_data
@@ -430,6 +521,11 @@ class MainWindow(QMainWindow):
         self.flow_amount_col_idx = f.get("amount_col_idx")
         self.flow_event_options = list(f.get("event_options") or [])
         self.flow_event_col_idx = f.get("event_col_idx")
+        self.flow_working_sheet_name = f.get("working_sheet_name")
+        self.flow_working_sheet_idx = f.get("working_sheet_idx")
+        self.flow_row_event_keys = dict(f.get("row_event_keys") or {})
+        self.flow_prefilled_event_rows = set(f.get("prefilled_event_rows") or [])
+        self.flow_unlocked_event_rows = set(f.get("unlocked_event_rows") or [])
         self.flow_last_output_sheet_name = f.get("last_output_sheet_name")
         lod = f.get("last_output_sheet_data")
         self.flow_last_output_sheet_data = clone_grid(lod) if lod else None
@@ -553,6 +649,11 @@ class MainWindow(QMainWindow):
         self.flow_amount_col_idx = None
         self.flow_event_options = []
         self.flow_event_col_idx = None
+        self.flow_working_sheet_name = None
+        self.flow_working_sheet_idx = None
+        self.flow_row_event_keys = {}
+        self.flow_prefilled_event_rows = set()
+        self.flow_unlocked_event_rows = set()
         self.flow_last_output_sheet_name = None
         self.flow_last_output_sheet_data = None
         self.flow_last_output_amount_col_idx = None
@@ -566,9 +667,9 @@ class MainWindow(QMainWindow):
         self.events_button.setEnabled(
             mode_active and self.flow_amount_col_idx is not None and bool(self.flow_event_options)
         )
-        self.apply_mapping_button.setEnabled(
+        self.mapping_refresh_button.setEnabled(
             mode_active
-            and self.flow_source_sheet_idx is not None
+            and self._resolve_flow_working_sheet_idx() is not None
             and self.flow_amount_col_idx is not None
             and self.flow_event_col_idx is not None
             and bool(self.flow_event_options)
@@ -602,6 +703,14 @@ class MainWindow(QMainWindow):
         self.flow_amount_col_idx = None
         self.flow_event_options = []
         self.flow_event_col_idx = None
+        self.flow_working_sheet_name = None
+        self.flow_working_sheet_idx = None
+        self.flow_row_event_keys = {}
+        self.flow_prefilled_event_rows = set()
+        self.flow_unlocked_event_rows = set()
+        self.flow_last_output_sheet_name = None
+        self.flow_last_output_sheet_data = None
+        self.flow_last_output_amount_col_idx = None
         self.flow_status_label.setText(
             f"Step 2: choose Amount data column on “{self.sheets_data[src_idx]['name']}”"
         )
@@ -615,6 +724,24 @@ class MainWindow(QMainWindow):
         if self.flow_source_sheet_idx < 0 or self.flow_source_sheet_idx >= len(self.sheets_data):
             return None
         return self.sheets_data[self.flow_source_sheet_idx]["data"]
+
+    def _resolve_flow_working_sheet_idx(self):
+        if self.flow_working_sheet_name:
+            for idx, sheet in enumerate(self.sheets_data):
+                if sheet.get("name") == self.flow_working_sheet_name:
+                    self.flow_working_sheet_idx = idx
+                    return idx
+        idx = self.flow_working_sheet_idx
+        if idx is not None and 0 <= idx < len(self.sheets_data):
+            self.flow_working_sheet_name = self.sheets_data[idx].get("name")
+            return idx
+        return None
+
+    def _current_working_data(self):
+        idx = self._resolve_flow_working_sheet_idx()
+        if idx is None:
+            return None
+        return self.sheets_data[idx]["data"]
 
     def choose_amount_data_column(self):
         data = self._current_source_data()
@@ -690,7 +817,8 @@ class MainWindow(QMainWindow):
         self._push_history_before_change()
         self.flow_event_options = merged
         if self.flow_event_col_idx is not None:
-            self._refresh_event_dropdowns_on_source_sheet()
+            self._refresh_event_widgets_on_working_sheet()
+            self._recompute_flow_mapping_on_working_sheet(announce=True)
         self.flow_status_label.setText(
             f"Step 4: Click Events to add/select Event column ({len(merged)} total option(s))"
         )
@@ -776,50 +904,118 @@ class MainWindow(QMainWindow):
                     row.append("")
                 row.insert(event_col_idx, "Event" if r == 0 else "")
         self.flow_event_col_idx = event_col_idx
-        self.render_preview_and_selection()
-        if self.flow_source_sheet_idx is not None:
-            self.preview_tabs.setCurrentIndex(self.flow_source_sheet_idx)
-        self.flow_status_label.setText("Step 5: Choose Events per row and click Apply mapping")
-        self._update_flow_buttons_state()
-        self.statusBar().showMessage("Events column is ready. Choose event values from dropdowns.")
+        self.flow_row_event_keys = {}
+        self.flow_prefilled_event_rows = set()
+        self.flow_unlocked_event_rows = set()
+        for row_idx in range(1, len(data)):
+            row = data[row_idx]
+            event_text = str(row[event_col_idx] if event_col_idx < len(row) else "").strip()
+            if event_text:
+                self.flow_prefilled_event_rows.add(row_idx)
+                continue
+            # Empty event cells are ready for dropdown-based mapping.
+            self.flow_row_event_keys.pop(row_idx, None)
 
-    def apply_inflow_outflow_mapping(self):
-        data = self._current_source_data()
+        old_work_idx = self._resolve_flow_working_sheet_idx()
+        if old_work_idx is not None and 0 <= old_work_idx < len(self.sheets_data):
+            self.sheets_data.pop(old_work_idx)
+            self.flow_working_sheet_idx = None
+            self.flow_working_sheet_name = None
+            self.flow_last_output_sheet_name = None
+            self.flow_last_output_sheet_data = None
+        used_names = {s["name"] for s in self.sheets_data}
+        output_name = self.make_unique_sheet_name("Mapped_cashflow_working", used_names)
+        out_sheet = {"name": output_name, "data": clone_grid(data), "is_table": True}
+        self.sheets_data.append(out_sheet)
+        self.flow_working_sheet_idx = len(self.sheets_data) - 1
+        self.flow_working_sheet_name = output_name
+        self.flow_last_output_sheet_name = output_name
+        self.flow_last_output_amount_col_idx = self.flow_amount_col_idx
+        self._recompute_flow_mapping_on_working_sheet(render=True, announce=False)
+        working_idx = self._resolve_flow_working_sheet_idx()
+        if working_idx is not None:
+            self.preview_tabs.setCurrentIndex(working_idx)
+        self.flow_status_label.setText("Step 5: Edit Event cells or use dropdown; mapping updates in real time")
+        self._update_flow_buttons_state()
+        self.statusBar().showMessage("Events column is ready. Working mapped sheet created with real-time updates.")
+
+    def _recompute_flow_mapping_on_working_sheet(self, render: bool = False, announce: bool = False):
+        data = self._current_working_data()
         if data is None:
-            self.statusBar().showMessage("Start cash flow mapping first.")
             return
         if self.flow_amount_col_idx is None or self.flow_event_col_idx is None:
-            self.statusBar().showMessage("Set amount data and events column first.")
             return
-        mapped_data, stats, created = apply_event_amount_mapping(
+        mapped_data, stats, _created = apply_event_amount_mapping(
             clone_grid(data),
             amount_col_idx=self.flow_amount_col_idx,
             event_col_idx=self.flow_event_col_idx,
             options=self.flow_event_options,
+            row_event_keys=self.flow_row_event_keys,
         )
-        if created:
-            msg = (
-                "The app will auto-create missing destination header columns:\n- "
-                + "\n- ".join(created)
-                + "\n\nContinue?"
-            )
-            if QMessageBox.question(self, "Create headers", msg) != QMessageBox.StandardButton.Yes:
-                return
-        self._push_history_before_change()
-        used_names = {s["name"] for s in self.sheets_data}
-        output_name = self.make_unique_sheet_name("Mapped_cashflow", used_names)
-        out_sheet = {"name": output_name, "data": mapped_data, "is_table": True}
-        self.sheets_data.append(out_sheet)
-        self.flow_last_output_sheet_name = output_name
+        idx = self._resolve_flow_working_sheet_idx()
+        if idx is None:
+            return
+        self.sheets_data[idx]["data"] = mapped_data
         self.flow_last_output_sheet_data = clone_grid(mapped_data)
-        self.flow_last_output_amount_col_idx = self.flow_amount_col_idx
-        self.render_preview_and_selection()
-        self.preview_tabs.setCurrentIndex(len(self.sheets_data) - 1)
+        if render:
+            self.render_preview_and_selection()
+            idx = self._resolve_flow_working_sheet_idx()
+            if idx is not None:
+                self.preview_tabs.setCurrentIndex(idx)
+        else:
+            self._refresh_working_sheet_table_view()
+        if announce:
+            self.statusBar().showMessage(
+                f"Mapped rows updated: {stats['rows_updated']} updated, {stats['rows_skipped']} skipped."
+            )
+
+    def _refresh_working_sheet_table_view(self):
+        idx = self._resolve_flow_working_sheet_idx()
+        if idx is None or idx >= len(self.preview_tables):
+            return
+        if idx >= len(self.sheets_data):
+            return
+        data = self.sheets_data[idx]["data"]
+        table = self.preview_tables[idx]
+        self._is_rendering_preview = True
+        try:
+            ncols = max((len(r) for r in data), default=0)
+            table.setColumnCount(ncols)
+            table.setRowCount(len(data))
+            for row_idx, row in enumerate(data):
+                for col_idx in range(ncols):
+                    if row_idx > 0 and col_idx == self.flow_event_col_idx:
+                        continue
+                    cell_value = row[col_idx] if col_idx < len(row) else ""
+                    item = table.item(row_idx, col_idx)
+                    if item is None:
+                        item = QTableWidgetItem(str(cell_value))
+                        table.setItem(row_idx, col_idx, item)
+                    else:
+                        item.setText(str(cell_value))
+                    if row_idx == 0:
+                        item.setBackground(QColor(68, 114, 196))
+                        item.setForeground(QColor(255, 255, 255))
+            table.resizeColumnsToContents()
+        finally:
+            self._is_rendering_preview = False
+        self._refresh_event_widgets_on_working_sheet()
+
+    def apply_inflow_outflow_mapping(self):
+        data = self._current_working_data()
+        if data is None:
+            self.statusBar().showMessage("Set up Events first to create the working mapped sheet.")
+            return
+        if self.flow_amount_col_idx is None or self.flow_event_col_idx is None:
+            self.statusBar().showMessage("Set amount data and events column first.")
+            return
+        self._push_history_before_change()
+        self._recompute_flow_mapping_on_working_sheet(render=True, announce=True)
+        idx = self._resolve_flow_working_sheet_idx()
+        if idx is not None:
+            self.preview_tabs.setCurrentIndex(idx)
         self._update_flow_buttons_state()
-        self.statusBar().showMessage(
-            f"{output_name} created: {stats['rows_updated']} row(s) updated, "
-            f"{stats['rows_skipped']} skipped, {len(created)} header(s) created."
-        )
+        self.statusBar().showMessage("Mapping recomputed from current Event selections.")
 
     def undo_last_flow_output(self):
         if not self.flow_last_output_sheet_name:
@@ -832,6 +1028,11 @@ class MainWindow(QMainWindow):
                 remove_idx = i
                 break
         if remove_idx is None:
+            self.flow_working_sheet_idx = None
+            self.flow_working_sheet_name = None
+            self.flow_row_event_keys = {}
+            self.flow_prefilled_event_rows = set()
+            self.flow_unlocked_event_rows = set()
             self.flow_last_output_sheet_name = None
             self.flow_last_output_sheet_data = None
             self.flow_last_output_amount_col_idx = None
@@ -840,6 +1041,11 @@ class MainWindow(QMainWindow):
             return
         self._push_history_before_change()
         self.sheets_data.pop(remove_idx)
+        self.flow_working_sheet_idx = None
+        self.flow_working_sheet_name = None
+        self.flow_row_event_keys = {}
+        self.flow_prefilled_event_rows = set()
+        self.flow_unlocked_event_rows = set()
         self.flow_last_output_sheet_name = None
         self.flow_last_output_sheet_data = None
         self.flow_last_output_amount_col_idx = None
@@ -869,7 +1075,7 @@ class MainWindow(QMainWindow):
 
     def finish_flow_with_total_check(self):
         if not self.flow_last_output_sheet_name:
-            self.statusBar().showMessage("Apply mapping first to create a mapped sheet.")
+            self.statusBar().showMessage("Set up Events first to create a mapped working sheet.")
             return
         sheet = None
         for s in self.sheets_data:
@@ -877,7 +1083,7 @@ class MainWindow(QMainWindow):
                 sheet = s
                 break
         if sheet is None:
-            QMessageBox.warning(self, "Done", "Mapped sheet was not found. Apply mapping again.")
+            QMessageBox.warning(self, "Done", "Mapped working sheet was not found. Recreate Events setup.")
             return
 
         classify = QMessageBox(self)
@@ -1425,6 +1631,24 @@ class MainWindow(QMainWindow):
             return
         self._push_history_before_change()
         self.sheets_data[sheet_idx]["data"] = [data[i] for i in visual_order]
+        work_idx = self._resolve_flow_working_sheet_idx()
+        if work_idx is not None and sheet_idx == work_idx:
+            remapped = {}
+            remapped_prefilled = set()
+            remapped_unlocked = set()
+            for new_row, old_row in enumerate(visual_order):
+                if new_row == 0:
+                    continue
+                key = self.flow_row_event_keys.get(old_row)
+                if key:
+                    remapped[new_row] = key
+                if old_row in self.flow_prefilled_event_rows:
+                    remapped_prefilled.add(new_row)
+                if old_row in self.flow_unlocked_event_rows:
+                    remapped_unlocked.add(new_row)
+            self.flow_row_event_keys = remapped
+            self.flow_prefilled_event_rows = remapped_prefilled
+            self.flow_unlocked_event_rows = remapped_unlocked
         current = self.preview_tabs.currentIndex()
         self.render_preview_and_selection()
         self.preview_tabs.setCurrentIndex(current if current >= 0 else sheet_idx)
@@ -1445,7 +1669,7 @@ class MainWindow(QMainWindow):
             padded = list(row) + [""] * max(0, count - len(row))
             reordered.append([padded[i] for i in visual_order])
         self.sheets_data[sheet_idx]["data"] = reordered
-        if self.flow_source_sheet_idx == sheet_idx:
+        if self.flow_source_sheet_idx == sheet_idx or self._resolve_flow_working_sheet_idx() == sheet_idx:
             def remap(idx):
                 return visual_order.index(idx) if idx is not None and idx in visual_order else idx
             self.flow_amount_col_idx = remap(self.flow_amount_col_idx)
@@ -1645,7 +1869,7 @@ class MainWindow(QMainWindow):
 
         self.preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
         self._update_clear_primary_filter_button_state()
-        self._refresh_event_dropdowns_on_source_sheet()
+        self._refresh_event_widgets_on_working_sheet()
         self._is_rendering_preview = False
 
     def _on_preview_item_changed(self, sheet_idx: int, item: QTableWidgetItem):
@@ -1664,41 +1888,90 @@ class MainWindow(QMainWindow):
         while len(row) <= col_idx:
             row.append("")
         row[col_idx] = item.text()
+        work_idx = self._resolve_flow_working_sheet_idx()
+        if (
+            work_idx is not None
+            and sheet_idx == work_idx
+            and row_idx > 0
+            and (col_idx == self.flow_amount_col_idx or col_idx == self.flow_event_col_idx)
+        ):
+            if col_idx == self.flow_event_col_idx and not str(item.text() or "").strip():
+                self.flow_row_event_keys.pop(row_idx, None)
+            self._recompute_flow_mapping_on_working_sheet(render=False, announce=False)
 
-    def _refresh_event_dropdowns_on_source_sheet(self):
-        if self.flow_source_sheet_idx is None or self.flow_event_col_idx is None:
+    def _refresh_event_widgets_on_working_sheet(self):
+        work_idx = self._resolve_flow_working_sheet_idx()
+        if work_idx is None or self.flow_event_col_idx is None:
             return
-        if self.flow_source_sheet_idx >= len(self.preview_tables) or self.flow_source_sheet_idx >= len(self.sheets_data):
+        if work_idx >= len(self.preview_tables) or work_idx >= len(self.sheets_data):
             return
-        table = self.preview_tables[self.flow_source_sheet_idx]
-        data = self.sheets_data[self.flow_source_sheet_idx]["data"]
+        table = self.preview_tables[work_idx]
+        data = self.sheets_data[work_idx]["data"]
         col_idx = self.flow_event_col_idx
         if not data:
             return
-        for row_idx in range(1, len(data)):
-            if col_idx >= len(data[row_idx]):
-                data[row_idx].extend([""] * (col_idx - len(data[row_idx]) + 1))
-            current = str(data[row_idx][col_idx] or "").strip()
-            table.removeCellWidget(row_idx, col_idx)
-            table.takeItem(row_idx, col_idx)
-            combo = QComboBox(table)
-            combo.addItem("")
-            for option in self.flow_event_options:
-                combo.addItem(option)
-            combo.setCurrentText(current if current in self.flow_event_options else "")
-            combo.currentTextChanged.connect(
-                lambda text, r=row_idx: self._on_event_option_changed(r, text)
-            )
-            table.setCellWidget(row_idx, col_idx, combo)
+        focus_widget = QApplication.focusWidget()
+        focused_row = None
+        focused_cursor_pos = None
+        if isinstance(focus_widget, QLineEdit):
+            parent_widget = focus_widget.parentWidget()
+            if isinstance(parent_widget, EventCellWidget):
+                for row_idx in range(1, len(data)):
+                    if table.cellWidget(row_idx, col_idx) is parent_widget:
+                        focused_row = row_idx
+                        focused_cursor_pos = focus_widget.cursorPosition()
+                        break
+        self._is_rendering_preview = True
+        try:
+            for row_idx in range(1, len(data)):
+                if col_idx >= len(data[row_idx]):
+                    data[row_idx].extend([""] * (col_idx - len(data[row_idx]) + 1))
+                current_text = str(data[row_idx][col_idx] or "")
+                selected_key = str(self.flow_row_event_keys.get(row_idx, "") or "")
+                widget = table.cellWidget(row_idx, col_idx)
+                if isinstance(widget, EventCellWidget):
+                    widget.sync_state(
+                        self.flow_event_options,
+                        text=current_text,
+                        selected_key=selected_key,
+                        combo_enabled=True,
+                    )
+                else:
+                    table.removeCellWidget(row_idx, col_idx)
+                    widget = EventCellWidget(
+                        self.flow_event_options,
+                        text=current_text,
+                        selected_key=selected_key,
+                        parent=table,
+                    )
+                    widget.combo.setEnabled(True)
+                    widget.textCommitted.connect(
+                        lambda text, r=row_idx: self._on_event_text_committed(r, text)
+                    )
+                    widget.optionPicked.connect(
+                        lambda text, r=row_idx: self._on_event_option_changed(r, text)
+                    )
+                    table.setCellWidget(row_idx, col_idx, widget)
+        finally:
+            self._is_rendering_preview = False
+        if focused_row is not None:
+            focused_widget = table.cellWidget(focused_row, col_idx)
+            if isinstance(focused_widget, EventCellWidget):
+                focused_widget.text_input.setFocus()
+                if focused_cursor_pos is not None:
+                    focused_widget.text_input.setCursorPosition(
+                        min(focused_cursor_pos, len(focused_widget.text_input.text()))
+                    )
 
-    def _on_event_option_changed(self, row_idx: int, text: str):
-        if self.flow_source_sheet_idx is None or self.flow_event_col_idx is None:
+    def _on_event_text_committed(self, row_idx: int, text: str):
+        work_idx = self._resolve_flow_working_sheet_idx()
+        if work_idx is None or self.flow_event_col_idx is None:
             return
         if not self._history_suspended:
             self._mark_cell_edit_for_undo_batch()
-        if self.flow_source_sheet_idx >= len(self.sheets_data):
+        if work_idx >= len(self.sheets_data):
             return
-        data = self.sheets_data[self.flow_source_sheet_idx]["data"]
+        data = self.sheets_data[work_idx]["data"]
         if row_idx >= len(data):
             return
         col = self.flow_event_col_idx
@@ -1706,6 +1979,54 @@ class MainWindow(QMainWindow):
         if col >= len(row):
             row.extend([""] * (col - len(row) + 1))
         row[col] = text
+        text_clean = str(text or "").strip()
+        if not text_clean:
+            if row_idx in self.flow_prefilled_event_rows:
+                self.flow_unlocked_event_rows.add(row_idx)
+            self.flow_row_event_keys.pop(row_idx, None)
+        elif self._is_known_header_text(text_clean, data):
+            # Manual overwrite to a known header immediately changes mapping destination.
+            self.flow_row_event_keys[row_idx] = text_clean
+        self._recompute_flow_mapping_on_working_sheet(render=False, announce=False)
+
+    def _on_event_option_changed(self, row_idx: int, text: str):
+        work_idx = self._resolve_flow_working_sheet_idx()
+        if work_idx is None or self.flow_event_col_idx is None:
+            return
+        if not self._history_suspended:
+            self._mark_cell_edit_for_undo_batch()
+        if work_idx >= len(self.sheets_data):
+            return
+        data = self.sheets_data[work_idx]["data"]
+        if row_idx >= len(data):
+            return
+        col = self.flow_event_col_idx
+        row = data[row_idx]
+        if col >= len(row):
+            row.extend([""] * (col - len(row) + 1))
+        current_text = str(row[col] or "").strip()
+        if text:
+            self.flow_row_event_keys[row_idx] = text
+            if not current_text:
+                row[col] = text
+            elif self._is_known_header_text(current_text, data):
+                # Existing header text should be replaced by selected option text.
+                row[col] = text
+        else:
+            self.flow_row_event_keys.pop(row_idx, None)
+        self._recompute_flow_mapping_on_working_sheet(render=False, announce=False)
+
+    def _is_known_header_text(self, text: str, data: list[list[object]]) -> bool:
+        if not text or not data:
+            return False
+        header = data[0] if data else []
+        normalized = normalize_header(text)
+        if not normalized:
+            return False
+        for value in header:
+            if normalize_header(value) == normalized:
+                return True
+        return False
 
     def make_unique_sheet_name(self, base_name, used_names):
         name = base_name
@@ -1764,3 +2085,117 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             self.statusBar().showMessage(f"Error saving: {str(e)}")
+
+    def _full_grid_from_sheet_idx(self, sheet_idx: int):
+        if sheet_idx < 0 or sheet_idx >= len(self.sheets_data):
+            return []
+        return [list(r) for r in self.sheets_data[sheet_idx].get("data", [])]
+
+    def _selection_grid_from_active_table(self):
+        sheet_idx = self.preview_tabs.currentIndex()
+        if sheet_idx < 0 or sheet_idx >= len(self.preview_tables):
+            return []
+        table = self.preview_tables[sheet_idx]
+        sel_model = table.selectionModel()
+        if sel_model is None:
+            return []
+        selected = sel_model.selectedIndexes()
+        if not selected:
+            return []
+        min_row = min(i.row() for i in selected)
+        max_row = max(i.row() for i in selected)
+        min_col = min(i.column() for i in selected)
+        max_col = max(i.column() for i in selected)
+        selected_lookup = {(i.row(), i.column()): i for i in selected}
+        grid = []
+        for r in range(min_row, max_row + 1):
+            out_row = []
+            for c in range(min_col, max_col + 1):
+                if (r, c) in selected_lookup:
+                    item = table.item(r, c)
+                    out_row.append(item.text() if item else "")
+                else:
+                    out_row.append("")
+            grid.append(out_row)
+        return grid
+
+    def update_existing_excel(self):
+        if not self.sheets_data:
+            self.statusBar().showMessage("Load a PDF or Excel file first.")
+            return
+        active_idx = self.preview_tabs.currentIndex()
+        if active_idx < 0 or active_idx >= len(self.sheets_data):
+            active_idx = 0
+        active_name = self.sheets_data[active_idx]["name"]
+        has_selection = bool(self._selection_grid_from_active_table())
+        dlg = UpdateExistingExcelDialog(
+            self,
+            active_sheet_name=active_name,
+            has_selection=has_selection,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        config = dlg.result()
+        if not config:
+            return
+        dest_path = config["path"]
+        try:
+            if config["mode"] == "add_sheets":
+                sheets_to_add = []
+                used = set()
+                for sheet_idx, sheet in enumerate(self.sheets_data):
+                    if not self.selected_sheets.get(sheet_idx, False):
+                        continue
+                    name = self.make_unique_sheet_name(sheet["name"], used)
+                    sheets_to_add.append({"name": name, "data": self._full_grid_from_sheet_idx(sheet_idx)})
+                if not sheets_to_add:
+                    QMessageBox.information(self, "Update existing workbook", "Select at least one app sheet to add.")
+                    return
+                from converter import append_sheets_to_existing_workbook
+                append_sheets_to_existing_workbook(dest_path, sheets_to_add)
+                self.statusBar().showMessage(f"Added {len(sheets_to_add)} sheet(s) to existing workbook.")
+                return
+
+            source_mode = config.get("source_mode")
+            if source_mode == "selection":
+                grid = self._selection_grid_from_active_table()
+                if not grid:
+                    QMessageBox.information(self, "Update existing workbook", "No highlighted cells found on active sheet.")
+                    return
+            else:
+                grid = self._full_grid_from_sheet_idx(active_idx)
+                if not grid:
+                    QMessageBox.information(self, "Update existing workbook", "Active sheet has no data.")
+                    return
+            rows = len(grid)
+            cols = max((len(r) for r in grid), default=0)
+            from converter import has_nonempty_cells_in_target_range, paste_values_into_existing_sheet
+            if has_nonempty_cells_in_target_range(
+                dest_path,
+                config["sheet_name"],
+                config["start_cell"],
+                rows,
+                cols,
+            ):
+                if QMessageBox.question(
+                    self,
+                    "Overwrite destination cells?",
+                    "Destination range already has values. Continue and overwrite those cells?",
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+            paste_values_into_existing_sheet(
+                dest_path,
+                config["sheet_name"],
+                config["start_cell"],
+                grid,
+                clear_grid=bool(config.get("clear_first")),
+            )
+            self.statusBar().showMessage("Pasted values into existing workbook successfully.")
+        except PermissionError:
+            QMessageBox.warning(
+                self,
+                "Workbook locked",
+                "Could not write to destination workbook. Close it in Excel and try again.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Update existing workbook", str(e))

@@ -5,8 +5,10 @@ Simple, reliable extraction for MARCH bank statements.
 import pdfplumber
 from coordinate_fallback import reconstruct_transactions_coordinate, should_use_coordinate_fallback
 from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 import re
 
 PAGE_MARKER_RE = re.compile(r"\b(?:page|pg|p|pag)\.?\s*\d+\b", re.I)
@@ -1317,6 +1319,82 @@ def export_to_excel(sheets_data, output_path):
                     pass
             ws.column_dimensions[column_letter].width = min(max_length + 2, 50)
     wb.save(output_path)
+
+
+def _sanitize_sheet_name(name, existing_names):
+    base = str(name or "Sheet").strip() or "Sheet"
+    cleaned = base[:31].replace('[', '').replace(']', '').replace(':', '').replace('*', '').replace('?', '').replace('/', '')
+    if not cleaned:
+        cleaned = "Sheet"
+    candidate = cleaned
+    n = 2
+    existing_lower = {str(v).lower() for v in existing_names}
+    while candidate.lower() in existing_lower:
+        suffix = f"_{n}"
+        candidate = f"{cleaned[:31-len(suffix)]}{suffix}"
+        n += 1
+    return candidate
+
+
+def append_sheets_to_existing_workbook(dest_path, sheets_data):
+    """Append app sheets as new sheets to an existing workbook (value-only writes)."""
+    wb = load_workbook(dest_path)
+    existing_names = list(wb.sheetnames)
+    for sheet_info in sheets_data:
+        src_name = sheet_info.get("name", "Sheet")
+        data = sheet_info.get("data", [])
+        safe_name = _sanitize_sheet_name(src_name, existing_names)
+        ws = wb.create_sheet(safe_name)
+        existing_names.append(safe_name)
+        for r, row in enumerate(data, 1):
+            for c, value in enumerate(row, 1):
+                ws.cell(row=r, column=c).value = value
+    wb.save(dest_path)
+    wb.close()
+
+
+def paste_values_into_existing_sheet(dest_path, sheet_name, start_cell, grid, *, clear_grid=False):
+    """
+    Paste grid values into existing worksheet from start_cell, preserving destination formatting.
+    Optionally clear the whole destination rectangle before writing.
+    """
+    wb = load_workbook(dest_path)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Destination sheet '{sheet_name}' not found.")
+    ws = wb[sheet_name]
+    start_row, start_col = coordinate_to_tuple(start_cell)
+    rows = len(grid)
+    cols = max((len(r) for r in grid), default=0)
+    if clear_grid and rows > 0 and cols > 0:
+        for rr in range(rows):
+            for cc in range(cols):
+                ws.cell(row=start_row + rr, column=start_col + cc).value = None
+    for rr, row in enumerate(grid):
+        for cc in range(cols):
+            value = row[cc] if cc < len(row) else ""
+            ws.cell(row=start_row + rr, column=start_col + cc).value = value
+    wb.save(dest_path)
+    wb.close()
+
+
+def has_nonempty_cells_in_target_range(dest_path, sheet_name, start_cell, rows, cols):
+    """Return True when destination range already has non-empty cell values."""
+    if rows <= 0 or cols <= 0:
+        return False
+    wb = load_workbook(dest_path, read_only=True, data_only=False)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Destination sheet '{sheet_name}' not found.")
+    ws = wb[sheet_name]
+    start_row, start_col = coordinate_to_tuple(start_cell)
+    try:
+        for rr in range(rows):
+            for cc in range(cols):
+                value = ws.cell(row=start_row + rr, column=start_col + cc).value
+                if value not in (None, ""):
+                    return True
+        return False
+    finally:
+        wb.close()
 
 
 def get_sheet_preview(sheets_data, max_rows=10):
