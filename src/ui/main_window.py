@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QTableWidget,
     QTableWidgetItem,
+    QTableWidgetSelectionRange,
     QFileDialog,
     QWidget,
     QStatusBar,
@@ -28,25 +29,42 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QSplitter,
     QMenu,
+    QToolButton,
+    QStyle,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt6.QtGui import QColor, QKeyEvent, QKeySequence
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QPoint
+from PyQt6.QtGui import QColor, QKeyEvent, QKeySequence, QMouseEvent
+from PyQt6.QtCore import QItemSelection
 
 from ui.sheet_tools_dialogs import (
     ImportColumnsDialog,
-    PrimaryColumnDialog,
     SheetSelectionDialog,
     ColumnSelectionDialog,
     EventColumnModeDialog,
+    EventTemplateDialog,
     UpdateExistingExcelDialog,
 )
 from utils.sheet_ops import filter_rows_by_positive_primary, validate_numeric_primary_column
 from utils.event_ops import (
     apply_event_amount_mapping,
+    auto_assign_events_by_description,
     clone_grid,
+    detect_description_column,
     normalize_header,
     summarize_totals_for_headers,
 )
+from converter import (
+    extract_all_tables_from_pdf,
+    export_to_excel,
+    append_sheets_to_existing_workbook,
+    has_nonempty_cells_in_target_range,
+    paste_values_into_existing_sheet,
+)
+from utils.updater import safe_check_latest, download_release_exe_to_temp, verify_download, apply_update_and_restart, DEFAULT_REPO
+try:
+    from utils.excel_loader import load_xlsx_to_sheets_data
+except ImportError:
+    from excel_loader import load_xlsx_to_sheets_data
 
 
 class ConversionWorker(QThread):
@@ -61,8 +79,6 @@ class ConversionWorker(QThread):
 
     def run(self):
         try:
-            from converter import extract_all_tables_from_pdf
-
             sheets_data = extract_all_tables_from_pdf(self.pdf_path)
             self.finished.emit(sheets_data)
         except Exception as e:
@@ -134,11 +150,261 @@ class EventCellWidget(QWidget):
         self.combo.view().setMinimumWidth(popup_width)
 
 
-def _deep_copy_sheets(sheets_data):
-    return [
-        {"name": s["name"], "data": [list(row) for row in s["data"]], "is_table": s.get("is_table", True)}
-        for s in sheets_data
-    ]
+from PyQt6.QtWidgets import QHeaderView
+
+
+class ExcelLikeHeaderView(QHeaderView):
+    """
+    Excel-like header interactions for QTableWidget.
+
+    - Drag on header (no Ctrl): select a contiguous range of rows/columns.
+    - Ctrl+click: toggle selection of a single row/column.
+    - Ctrl+drag: move rows/columns (native QHeaderView movable behavior).
+    """
+
+    def __init__(self, orientation: Qt.Orientation, table: QTableWidget):
+        super().__init__(orientation, table)
+        self._table = table
+        self._orientation = orientation
+        self.setSectionsMovable(True)
+        self.setSectionsClickable(True)
+        self._drag_selecting = False
+        self._ctrl_pressed = False
+        self._start_logical = -1
+        self._press_pos = QPoint()
+        self._ctrl_drag_started = False
+        self._pending_ctrl_logical = -1
+        self._ctrl_intercepting_click = False
+        self._ctrl_press_event: QMouseEvent | None = None
+        self._right_pressed = False
+        self._right_press_pos = QPoint()
+        self._right_drag_started = False
+        self._right_press_event: QMouseEvent | None = None
+
+    def _logical_at(self, pos: QPoint) -> int:
+        return int(self.logicalIndexAt(pos))
+
+    def _is_on_resize_handle(self, pos: QPoint) -> bool:
+        """
+        Return True if the pointer is close enough to a section border that Qt would resize.
+        When this is True we must NOT intercept mouse drags for selection, otherwise resizing breaks.
+        """
+        logical = self._logical_at(pos)
+        if logical < 0:
+            return False
+        grip = 4  # px tolerance around divider
+        if self._orientation == Qt.Orientation.Horizontal:
+            x = int(pos.x())
+            start = int(self.sectionViewportPosition(logical))
+            end = start + int(self.sectionSize(logical))
+            # Near left edge (divider with previous) or right edge (divider with next)
+            return abs(x - start) <= grip or abs(x - end) <= grip
+        y = int(pos.y())
+        start = int(self.sectionViewportPosition(logical))
+        end = start + int(self.sectionSize(logical))
+        return abs(y - start) <= grip or abs(y - end) <= grip
+
+    def _toggle_section_selected(self, logical: int):
+        sel = self._table.selectionModel()
+        if sel is None:
+            return
+        if self._orientation == Qt.Orientation.Horizontal:
+            sel.select(
+                self._table.model().index(0, logical),
+                sel.SelectionFlag.Toggle | sel.SelectionFlag.Columns,
+            )
+        else:
+            sel.select(
+                self._table.model().index(logical, 0),
+                sel.SelectionFlag.Toggle | sel.SelectionFlag.Rows,
+            )
+
+    def _select_range(self, start: int, end: int, *, clear_first: bool):
+        if start < 0 or end < 0:
+            return
+        a, b = (start, end) if start <= end else (end, start)
+        sel = self._table.selectionModel()
+        model = self._table.model()
+        if sel is None or model is None:
+            return
+        rows = self._table.rowCount()
+        cols = self._table.columnCount()
+        if rows <= 0 or cols <= 0:
+            return
+        if self._orientation == Qt.Orientation.Horizontal:
+            top_left = model.index(0, a)
+            bottom_right = model.index(rows - 1, b)
+            flags = sel.SelectionFlag.Columns
+        else:
+            top_left = model.index(a, 0)
+            bottom_right = model.index(b, cols - 1)
+            flags = sel.SelectionFlag.Rows
+        selection = QItemSelection(top_left, bottom_right)
+        base = sel.SelectionFlag.Select
+        if clear_first:
+            base |= sel.SelectionFlag.Clear
+        sel.select(selection, base | flags)
+
+    def _on_mouse_press(self, event: QMouseEvent) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        mods = event.modifiers()
+        self._ctrl_pressed = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        self._press_pos = event.pos()
+        # If user is grabbing a divider to resize, never intercept.
+        if self._is_on_resize_handle(self._press_pos):
+            return False
+        logical = self._logical_at(event.pos())
+        self._start_logical = logical
+        self._ctrl_drag_started = False
+
+        if logical < 0:
+            return False
+
+        if self._ctrl_pressed:
+            # Intercept Ctrl+click to avoid Qt's default click-selection "flash".
+            # If the user drags enough, we'll replay the press into Qt so Ctrl+drag moves.
+            self._pending_ctrl_logical = logical
+            self._ctrl_intercepting_click = True
+            self._ctrl_press_event = event
+            return True
+
+        # Normal drag on header should select a range (Excel-like), not move sections.
+        # Temporarily disable movement so Qt won't treat it as a reorder drag.
+        self.setSectionsMovable(False)
+        self._drag_selecting = True
+        self._select_range(logical, logical, clear_first=True)
+        return True
+
+    def _on_mouse_move(self, event: QMouseEvent) -> bool:
+        if self._start_logical < 0:
+            return False
+
+        if self._ctrl_pressed:
+            if not self._ctrl_drag_started and (event.pos() - self._press_pos).manhattanLength() >= 4:
+                self._ctrl_drag_started = True
+                # Hand off to Qt's native move by replaying the original press we intercepted.
+                # After this, we forward move/release to Qt.
+                if self._ctrl_intercepting_click and self._ctrl_press_event is not None:
+                    self._ctrl_intercepting_click = False
+                    super().mousePressEvent(self._ctrl_press_event)
+            if self._ctrl_drag_started:
+                super().mouseMoveEvent(event)
+                return True
+            # Still within click slop; keep intercepting so Qt doesn't flash-select.
+            return True
+
+        if not self._drag_selecting:
+            return False
+        current = self._logical_at(event.pos())
+        if current < 0:
+            return True
+        self._select_range(self._start_logical, current, clear_first=True)
+        return True
+
+    def _on_mouse_release(self, event: QMouseEvent) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        try:
+            if self._ctrl_pressed and not self._ctrl_drag_started and self._pending_ctrl_logical >= 0:
+                # Ctrl+click toggles selection like Excel.
+                self._toggle_section_selected(self._pending_ctrl_logical)
+                return True
+            if self._ctrl_pressed and self._ctrl_drag_started:
+                super().mouseReleaseEvent(event)
+                return True
+            if self._drag_selecting:
+                return True
+            return False
+        finally:
+            self._drag_selecting = False
+            self._ctrl_pressed = False
+            self._start_logical = -1
+            self._pending_ctrl_logical = -1
+            self._ctrl_intercepting_click = False
+            self._ctrl_press_event = None
+            # Restore movable behavior for Ctrl+drag reordering.
+            self.setSectionsMovable(True)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton:
+            # Right-click: keep context-menu behavior, but allow right-drag to move headers.
+            self._right_pressed = True
+            self._right_drag_started = False
+            self._right_press_pos = event.pos()
+            self._right_press_event = event
+            super().mousePressEvent(event)
+            return
+        if self._on_mouse_press(event):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._right_pressed:
+            # Right-drag should move sections (non-conflicting shortcut).
+            if not self._right_drag_started and (event.pos() - self._right_press_pos).manhattanLength() >= 4:
+                self._right_drag_started = True
+                self.setSectionsMovable(True)
+                # Start native move by replaying a LEFT press at the original right-press position.
+                if self._right_press_event is not None:
+                    start = self._right_press_event
+                    fake_press = QMouseEvent(
+                        start.type(),
+                        start.position(),
+                        start.globalPosition(),
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton,
+                        start.modifiers() & ~Qt.KeyboardModifier.ControlModifier,
+                    )
+                    super().mousePressEvent(fake_press)
+            if self._right_drag_started:
+                fake_move = QMouseEvent(
+                    event.type(),
+                    event.position(),
+                    event.globalPosition(),
+                    Qt.MouseButton.NoButton,
+                    Qt.MouseButton.LeftButton,
+                    event.modifiers() & ~Qt.KeyboardModifier.ControlModifier,
+                )
+                super().mouseMoveEvent(fake_move)
+                event.accept()
+                return
+            # Still within click slop; do not interfere.
+            super().mouseMoveEvent(event)
+            return
+        if self._on_mouse_move(event):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton and self._right_pressed:
+            try:
+                if self._right_drag_started:
+                    fake_release = QMouseEvent(
+                        event.type(),
+                        event.position(),
+                        event.globalPosition(),
+                        Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.NoButton,
+                        event.modifiers() & ~Qt.KeyboardModifier.ControlModifier,
+                    )
+                    super().mouseReleaseEvent(fake_release)
+                    event.accept()
+                    return
+                # No drag → let the normal right-click release show the context menu.
+                super().mouseReleaseEvent(event)
+                return
+            finally:
+                self._right_pressed = False
+                self._right_drag_started = False
+                self._right_press_event = None
+        if self._on_mouse_release(event):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 def _deep_copy_grid(data):
@@ -186,6 +452,8 @@ class MainWindow(QMainWindow):
         self.flow_last_output_sheet_name = None
         self.flow_last_output_sheet_data = None
         self.flow_last_output_amount_col_idx = None
+        self.flow_description_col_idx = None
+        self.flow_event_aliases: dict[str, list[str]] = {}
         self._is_rendering_preview = False
         self._undo_stack: list = []
         self._redo_stack: list = []
@@ -200,6 +468,8 @@ class MainWindow(QMainWindow):
         self._preview_max_share = 0.70
         self._splitter_adjusting = False
         self._header_move_sync_in_progress = False
+        self._update_repo = DEFAULT_REPO
+        self._update_check_in_progress = False
         self.initUI()
 
     def initUI(self):
@@ -258,6 +528,13 @@ class MainWindow(QMainWindow):
         self.mapping_refresh_button.setMaximumWidth(48)
         self.mapping_refresh_button.clicked.connect(self.apply_inflow_outflow_mapping)
         side_btn_layout.addWidget(self.mapping_refresh_button)
+
+        self.update_button = QToolButton()
+        self.update_button.setToolTip("Check for updates")
+        self.update_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.update_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
+        side_btn_layout.addWidget(self.update_button)
         side_btn_layout.addStretch()
         preview_row.addLayout(side_btn_layout, stretch=0)
         top_layout.addLayout(preview_row)
@@ -305,6 +582,9 @@ class MainWindow(QMainWindow):
         self.add_column_button.clicked.connect(self.add_flow_header_column)
         self.list_items_button = QPushButton("List items")
         self.list_items_button.clicked.connect(self.capture_list_items_from_header_selection)
+        self.templates_button = QPushButton("Templates…")
+        self.templates_button.setToolTip("Save / load reusable event-header sets with alias keywords")
+        self.templates_button.clicked.connect(self.open_event_templates)
         self.events_button = QPushButton("Events")
         self.events_button.clicked.connect(self.setup_events_column)
         self.done_mapping_button = QPushButton("Done")
@@ -319,6 +599,7 @@ class MainWindow(QMainWindow):
         flow_layout.addWidget(self.amount_data_button)
         flow_layout.addWidget(self.add_column_button)
         flow_layout.addWidget(self.list_items_button)
+        flow_layout.addWidget(self.templates_button)
         flow_layout.addWidget(self.events_button)
         flow_layout.addWidget(self.done_mapping_button)
         flow_layout.addWidget(self.undo_mapping_button)
@@ -388,6 +669,8 @@ class MainWindow(QMainWindow):
         self._update_undo_redo_buttons()
 
         self.statusBar().showMessage("Ready — load a PDF or Excel file to begin")
+        # Background update check (best-effort; no popups unless update is found).
+        QTimer.singleShot(800, lambda: self.check_for_updates(manual=False))
 
     def _allowed_preview_height_bounds(self):
         total = self.height()
@@ -505,6 +788,8 @@ class MainWindow(QMainWindow):
                 if self.flow_last_output_sheet_data
                 else None,
                 "last_output_amount_col_idx": self.flow_last_output_amount_col_idx,
+                "description_col_idx": self.flow_description_col_idx,
+                "event_aliases": {k: list(v) for k, v in self.flow_event_aliases.items()},
             },
         }
 
@@ -530,6 +815,8 @@ class MainWindow(QMainWindow):
         lod = f.get("last_output_sheet_data")
         self.flow_last_output_sheet_data = clone_grid(lod) if lod else None
         self.flow_last_output_amount_col_idx = f.get("last_output_amount_col_idx")
+        self.flow_description_col_idx = f.get("description_col_idx")
+        self.flow_event_aliases = {k: list(v) for k, v in (f.get("event_aliases") or {}).items()}
 
     def _trim_undo_stack(self):
         while len(self._undo_stack) > self._max_undo_steps:
@@ -657,27 +944,108 @@ class MainWindow(QMainWindow):
         self.flow_last_output_sheet_name = None
         self.flow_last_output_sheet_data = None
         self.flow_last_output_amount_col_idx = None
+        self.flow_description_col_idx = None
+        self.flow_event_aliases = {}
         self._update_flow_buttons_state()
 
     def _update_flow_buttons_state(self):
         mode_active = self.flow_session_active and self.flow_source_sheet_idx is not None
+        has_working = (
+            self._resolve_flow_working_sheet_idx() is not None
+            and self.flow_amount_col_idx is not None
+            and self.flow_event_col_idx is not None
+            and bool(self.flow_event_options)
+        )
         self.amount_data_button.setEnabled(mode_active)
         self.add_column_button.setEnabled(mode_active)
         self.list_items_button.setEnabled(mode_active and self.flow_amount_col_idx is not None)
         self.events_button.setEnabled(
             mode_active and self.flow_amount_col_idx is not None and bool(self.flow_event_options)
         )
-        self.mapping_refresh_button.setEnabled(
-            mode_active
-            and self._resolve_flow_working_sheet_idx() is not None
-            and self.flow_amount_col_idx is not None
-            and self.flow_event_col_idx is not None
-            and bool(self.flow_event_options)
-        )
+        # Refresh should work whenever a mapped working sheet exists, even if the
+        # "flow session" isn't considered active (e.g. after loading templates later).
+        self.mapping_refresh_button.setEnabled(has_working)
         self.undo_mapping_button.setEnabled(bool(self.flow_last_output_sheet_name))
         self.done_mapping_button.setEnabled(bool(self.flow_last_output_sheet_name))
         if not mode_active:
             self.flow_status_label.setText("Step 1: Start cash flow mapping")
+
+    def check_for_updates(self, *, manual: bool):
+        if self._update_check_in_progress:
+            if manual:
+                self.statusBar().showMessage("Update check already running…")
+            return
+        self._update_check_in_progress = True
+        self.statusBar().showMessage("Checking for updates…")
+
+        current_version = QApplication.instance().applicationVersion() if QApplication.instance() else "0.0.0"
+
+        class _Worker(QThread):
+            done = pyqtSignal(object, object, bool)
+
+            def __init__(self, repo: str, current: str, manual_flag: bool):
+                super().__init__()
+                self._repo = repo
+                self._current = current
+                self._manual = manual_flag
+
+            def run(self):
+                rel, err = safe_check_latest(repo=self._repo, current_version=self._current)
+                self.done.emit(rel, err, self._manual)
+
+        self._update_worker = _Worker(self._update_repo, current_version, manual)
+        self._update_worker.done.connect(self._on_update_check_done)
+        self._update_worker.start()
+
+    def _on_update_check_done(self, rel, err, manual: bool):
+        self._update_check_in_progress = False
+        if err:
+            if manual:
+                QMessageBox.information(self, "Updates", f"Could not check for updates.\n\n{err}")
+            self.statusBar().showMessage("Update check failed.")
+            return
+        if rel is None:
+            if manual:
+                QMessageBox.information(self, "Updates", "You’re already on the latest version.")
+            self.statusBar().showMessage("No updates available.")
+            return
+
+        latest = rel.tag_name
+        current_version = QApplication.instance().applicationVersion() if QApplication.instance() else "0.0.0"
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Update available")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(f"A new version is available.\n\nInstalled: {current_version}\nLatest: {latest}\n\nDownload and install now?")
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if msg.exec() != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Update skipped.")
+            return
+
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self,
+                "Update",
+                "Auto-update is only available in the packaged .exe.\n\nOpen the Releases page and download the latest exe.",
+            )
+            self.statusBar().showMessage("Update requires packaged exe.")
+            return
+
+        try:
+            self.statusBar().showMessage("Downloading update…")
+            exe_path, sha_path = download_release_exe_to_temp(rel)
+            ok, detail = verify_download(exe_path, sha_path)
+            if not ok:
+                QMessageBox.critical(self, "Update", f"Downloaded update failed verification.\n\n{detail}")
+                self.statusBar().showMessage("Update verification failed.")
+                return
+            apply_update_and_restart(exe_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Update", f"Update failed.\n\n{e}")
+            self.statusBar().showMessage("Update failed.")
+            return
+
+        self.statusBar().showMessage("Applying update…")
+        QTimer.singleShot(250, self.close)
 
     def start_flow_workflow(self):
         if not self.sheets_data:
@@ -697,20 +1065,9 @@ class MainWindow(QMainWindow):
         if src_idx is None:
             return
         self._push_history_before_change()
+        self._reset_flow_session()
         self.flow_session_active = True
-        self.flow_mode = None
         self.flow_source_sheet_idx = src_idx
-        self.flow_amount_col_idx = None
-        self.flow_event_options = []
-        self.flow_event_col_idx = None
-        self.flow_working_sheet_name = None
-        self.flow_working_sheet_idx = None
-        self.flow_row_event_keys = {}
-        self.flow_prefilled_event_rows = set()
-        self.flow_unlocked_event_rows = set()
-        self.flow_last_output_sheet_name = None
-        self.flow_last_output_sheet_data = None
-        self.flow_last_output_amount_col_idx = None
         self.flow_status_label.setText(
             f"Step 2: choose Amount data column on “{self.sheets_data[src_idx]['name']}”"
         )
@@ -931,6 +1288,10 @@ class MainWindow(QMainWindow):
         self.flow_working_sheet_name = output_name
         self.flow_last_output_sheet_name = output_name
         self.flow_last_output_amount_col_idx = self.flow_amount_col_idx
+
+        # Auto-categorize: fill empty event cells based on description matches.
+        self._auto_categorize_working_sheet()
+
         self._recompute_flow_mapping_on_working_sheet(render=True, announce=False)
         working_idx = self._resolve_flow_working_sheet_idx()
         if working_idx is not None:
@@ -938,6 +1299,63 @@ class MainWindow(QMainWindow):
         self.flow_status_label.setText("Step 5: Edit Event cells or use dropdown; mapping updates in real time")
         self._update_flow_buttons_state()
         self.statusBar().showMessage("Events column is ready. Working mapped sheet created with real-time updates.")
+
+    def open_event_templates(self):
+        """Open the template manager. If user 'Loads into session', replace current options/aliases."""
+        dlg = EventTemplateDialog(
+            self,
+            current_options=list(self.flow_event_options),
+            current_aliases=dict(self.flow_event_aliases),
+        )
+        dlg.exec()
+        loaded = dlg.loaded_session()
+        if loaded is None:
+            return
+        options, aliases = loaded
+        self._push_history_before_change()
+        self.flow_event_options = list(options)
+        self.flow_event_aliases = dict(aliases)
+        # If a working sheet exists, refresh widgets and re-run auto-fill + spread.
+        if self._resolve_flow_working_sheet_idx() is not None:
+            self._auto_categorize_working_sheet()
+            self._refresh_event_widgets_on_working_sheet()
+            self._recompute_flow_mapping_on_working_sheet(announce=True)
+        self._update_flow_buttons_state()
+        self.statusBar().showMessage(f"Template loaded: {len(options)} header(s).")
+
+    def _auto_categorize_working_sheet(self):
+        """Auto-fill empty event cells on the working sheet using description matching."""
+        if not self.flow_event_options or self.flow_event_col_idx is None:
+            return
+        idx = self._resolve_flow_working_sheet_idx()
+        if idx is None:
+            return
+        data = self.sheets_data[idx]["data"]
+        if not data:
+            return
+        if self.flow_description_col_idx is None:
+            self.flow_description_col_idx = detect_description_column(data[0])
+        if self.flow_description_col_idx is None:
+            return
+        matches = auto_assign_events_by_description(
+            data,
+            event_col_idx=self.flow_event_col_idx,
+            description_col_idx=self.flow_description_col_idx,
+            options=self.flow_event_options,
+            aliases=self.flow_event_aliases,
+            prefilled_rows=self.flow_prefilled_event_rows,
+        )
+        if not matches:
+            return
+        for row_idx, matched in matches.items():
+            row = data[row_idx]
+            while len(row) <= self.flow_event_col_idx:
+                row.append("")
+            row[self.flow_event_col_idx] = matched
+            self.flow_row_event_keys[row_idx] = matched
+        self.statusBar().showMessage(
+            f"Auto-categorized {len(matches)} row(s) by description; review and edit any wrong assignments."
+        )
 
     def _recompute_flow_mapping_on_working_sheet(self, render: bool = False, announce: bool = False):
         data = self._current_working_data()
@@ -1180,11 +1598,6 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         try:
-            from utils.excel_loader import load_xlsx_to_sheets_data
-        except ImportError:
-            from excel_loader import load_xlsx_to_sheets_data
-
-        try:
             sheets_data = load_xlsx_to_sheets_data(file_path)
         except Exception as e:
             QMessageBox.critical(self, "Excel load error", str(e))
@@ -1229,22 +1642,12 @@ class MainWindow(QMainWindow):
     def on_extract_error(self, error_msg):
         self.statusBar().showMessage(f"Error: {error_msg}")
 
-    def _next_unique_sheet_name(self) -> str:
-        used = {s["name"] for s in self.sheets_data}
-        base = "Sheet"
-        name = base
-        n = 2
-        while name in used:
-            name = f"{base}_{n}"
-            n += 1
-        return name
-
     def add_blank_sheet(self):
         if not self.sheets_data:
             self.statusBar().showMessage("Load a PDF or Excel file first.")
             return
         self._push_history_before_change()
-        name = self._next_unique_sheet_name()
+        name = self.make_unique_sheet_name("Sheet", {s["name"] for s in self.sheets_data})
         self.sheets_data.append({"name": name, "data": [[""]], "is_table": True})
         self.render_preview_and_selection()
         self.preview_tabs.setCurrentIndex(len(self.sheets_data) - 1)
@@ -1271,7 +1674,7 @@ class MainWindow(QMainWindow):
             new_rows.append([row[i] if i < len(row) else "" for i in col_indices])
         self._push_history_before_change()
         if dest_idx < 0:
-            dest_name = self._next_unique_sheet_name()
+            dest_name = self.make_unique_sheet_name("Sheet", {s["name"] for s in self.sheets_data})
             self.sheets_data.append({"name": dest_name, "data": new_rows, "is_table": True})
         else:
             dest = self.sheets_data[dest_idx]
@@ -1294,7 +1697,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Filter", "This sheet has no data.")
             return
         header = data[0]
-        dlg = PrimaryColumnDialog(self, header)
+        dlg = ColumnSelectionDialog(
+            self,
+            header,
+            title="Filter by primary column",
+            prompt=(
+                "Choose a column that contains numbers only. "
+                "Rows where that column is empty, zero, or non-numeric will be removed (header row kept)."
+            ),
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         col_idx = dlg.selected_column_index()
@@ -1355,10 +1766,28 @@ class MainWindow(QMainWindow):
         self._update_flow_buttons_state()
 
     def _insert_blank_sheet_at(self, index: int):
-        name = self._next_unique_sheet_name()
+        name = self.make_unique_sheet_name("Sheet", {s["name"] for s in self.sheets_data})
         idx = max(0, min(index, len(self.sheets_data)))
         self.sheets_data.insert(idx, {"name": name, "data": [[""]], "is_table": True})
         return idx, name
+
+    def _do_rename_sheet(self, tab_idx: int):
+        if tab_idx < 0 or tab_idx >= len(self.sheets_data):
+            return
+        old_name = self.sheets_data[tab_idx]["name"]
+        new_name, ok = QInputDialog.getText(self, "Rename sheet", "New sheet name:", text=old_name)
+        if not ok:
+            return
+        new_name = str(new_name or "").strip()
+        if not new_name or new_name == old_name:
+            return
+        used = {s["name"] for i, s in enumerate(self.sheets_data) if i != tab_idx}
+        final_name = self.make_unique_sheet_name(new_name, used)
+        self._push_history_before_change()
+        self.sheets_data[tab_idx]["name"] = final_name
+        self.render_preview_and_selection()
+        self.preview_tabs.setCurrentIndex(tab_idx)
+        self.statusBar().showMessage(f"Renamed sheet to “{final_name}”.")
 
     def _show_sheet_tab_context_menu(self, pos):
         tab_bar = self.preview_tabs.tabBar()
@@ -1403,22 +1832,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Duplicated sheet as “{copy_name}”.")
             return
         if chosen == act_rename:
-            if tab_idx >= len(self.sheets_data):
-                return
-            old_name = self.sheets_data[tab_idx]["name"]
-            new_name, ok = QInputDialog.getText(self, "Rename sheet", "New sheet name:", text=old_name)
-            if not ok:
-                return
-            new_name = str(new_name or "").strip()
-            if not new_name or new_name == old_name:
-                return
-            used = {s["name"] for i, s in enumerate(self.sheets_data) if i != tab_idx}
-            final_name = self.make_unique_sheet_name(new_name, used)
-            self._push_history_before_change()
-            self.sheets_data[tab_idx]["name"] = final_name
-            self.render_preview_and_selection()
-            self.preview_tabs.setCurrentIndex(tab_idx)
-            self.statusBar().showMessage(f"Renamed sheet to “{final_name}”.")
+            self._do_rename_sheet(tab_idx)
             return
         if chosen == act_delete:
             if len(self.sheets_data) <= 1:
@@ -1437,24 +1851,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Sheet deleted.")
 
     def _rename_sheet_from_tab_double_click(self, tab_idx: int):
-        if tab_idx is None or tab_idx < 0:
-            return
-        if tab_idx >= len(self.sheets_data):
-            return
-        old_name = self.sheets_data[tab_idx]["name"]
-        new_name, ok = QInputDialog.getText(self, "Rename sheet", "New sheet name:", text=old_name)
-        if not ok:
-            return
-        new_name = str(new_name or "").strip()
-        if not new_name or new_name == old_name:
-            return
-        used = {s["name"] for i, s in enumerate(self.sheets_data) if i != tab_idx}
-        final_name = self.make_unique_sheet_name(new_name, used)
-        self._push_history_before_change()
-        self.sheets_data[tab_idx]["name"] = final_name
-        self.render_preview_and_selection()
-        self.preview_tabs.setCurrentIndex(tab_idx)
-        self.statusBar().showMessage(f"Renamed sheet to “{final_name}”.")
+        self._do_rename_sheet(tab_idx)
 
     def _insert_row_at(self, sheet_idx: int, row_idx: int):
         data = self.sheets_data[sheet_idx]["data"]
@@ -1787,6 +2184,22 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
 
+        preserved_tab = self.preview_tabs.currentIndex() if self.preview_tabs.count() > 0 else 0
+        preserved_views = {}
+        for idx, table in enumerate(self.preview_tables):
+            if not isinstance(table, QTableWidget):
+                continue
+            selected_ranges = []
+            for rng in table.selectedRanges():
+                selected_ranges.append((rng.topRow(), rng.leftColumn(), rng.bottomRow(), rng.rightColumn()))
+            preserved_views[idx] = {
+                "vscroll": table.verticalScrollBar().value(),
+                "hscroll": table.horizontalScrollBar().value(),
+                "current_row": table.currentRow(),
+                "current_col": table.currentColumn(),
+                "selected_ranges": selected_ranges,
+            }
+
         self.selected_sheets = {}
         self.preview_tables = []
         self.preview_tabs.clear()
@@ -1800,6 +2213,9 @@ class MainWindow(QMainWindow):
             sheet_name = sheet_info["name"]
             data = sheet_info["data"]
             table = QTableWidget()
+            # Allow Excel-like multi-selection across rows/columns/cells.
+            table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
             table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1808,10 +2224,13 @@ class MainWindow(QMainWindow):
             table.customContextMenuRequested.connect(
                 lambda pos, idx=sheet_idx, t=table: self._show_cell_context_menu(idx, t, pos)
             )
+            # Excel-like header behavior:
+            # - normal drag selects contiguous headers
+            # - Ctrl+drag moves rows/columns
+            table.setVerticalHeader(ExcelLikeHeaderView(Qt.Orientation.Vertical, table))
+            table.setHorizontalHeader(ExcelLikeHeaderView(Qt.Orientation.Horizontal, table))
             v_header = table.verticalHeader()
             h_header = table.horizontalHeader()
-            v_header.setSectionsMovable(True)
-            h_header.setSectionsMovable(True)
             v_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             h_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             v_header.customContextMenuRequested.connect(
@@ -1855,6 +2274,21 @@ class MainWindow(QMainWindow):
             self.preview_tabs.addTab(table, sheet_name)
             self.preview_tables.append(table)
 
+            # Restore preserved view state if available.
+            state = preserved_views.get(sheet_idx)
+            if state is not None:
+                table.verticalScrollBar().setValue(state.get("vscroll", 0))
+                table.horizontalScrollBar().setValue(state.get("hscroll", 0))
+                row = state.get("current_row", -1)
+                col = state.get("current_col", -1)
+                if row >= 0 and col >= 0 and row < table.rowCount() and col < table.columnCount():
+                    table.setCurrentCell(row, col)
+                for top, left, bottom, right in state.get("selected_ranges", []):
+                    if top >= 0 and left >= 0 and bottom < table.rowCount() and right < table.columnCount():
+                        table.setRangeSelected(
+                            QTableWidgetSelectionRange(top, left, bottom, right), True
+                        )
+
             ncols_display = max((len(r) for r in data), default=0) if data else 0
             checkbox = QCheckBox(f"{sheet_name} ({len(data)} rows, {ncols_display} cols)")
             checked = True
@@ -1868,6 +2302,8 @@ class MainWindow(QMainWindow):
             self.selected_sheets[sheet_idx] = checked
 
         self.preview_tabs.currentChanged.connect(self._on_preview_tab_changed)
+        if 0 <= preserved_tab < self.preview_tabs.count():
+            self.preview_tabs.setCurrentIndex(preserved_tab)
         self._update_clear_primary_filter_button_state()
         self._refresh_event_widgets_on_working_sheet()
         self._is_rendering_preview = False
@@ -2070,8 +2506,6 @@ class MainWindow(QMainWindow):
             final_sheets.append({"name": name, "data": sheet["data"], "is_table": True})
 
         try:
-            from converter import export_to_excel
-
             output_path = self.output_path_input.text()
 
             if not output_path.lower().endswith(".xlsx"):
@@ -2151,7 +2585,6 @@ class MainWindow(QMainWindow):
                 if not sheets_to_add:
                     QMessageBox.information(self, "Update existing workbook", "Select at least one app sheet to add.")
                     return
-                from converter import append_sheets_to_existing_workbook
                 append_sheets_to_existing_workbook(dest_path, sheets_to_add)
                 self.statusBar().showMessage(f"Added {len(sheets_to_add)} sheet(s) to existing workbook.")
                 return
@@ -2169,7 +2602,6 @@ class MainWindow(QMainWindow):
                     return
             rows = len(grid)
             cols = max((len(r) for r in grid), default=0)
-            from converter import has_nonempty_cells_in_target_range, paste_values_into_existing_sheet
             if has_nonempty_cells_in_target_range(
                 dest_path,
                 config["sheet_name"],
