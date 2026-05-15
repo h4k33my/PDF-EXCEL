@@ -20,9 +20,19 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QFileDialog,
     QRadioButton,
+    QInputDialog,
+    QHeaderView,
 )
 from PyQt6.QtGui import QColor
 from openpyxl import load_workbook
+
+from utils.templates import (
+    delete_template as _delete_template,
+    load_all_templates,
+    session_to_template,
+    template_to_session,
+    upsert_template,
+)
 
 
 class ImportColumnsDialog(QDialog):
@@ -116,42 +126,6 @@ class ImportColumnsDialog(QDialog):
     def result(self) -> Tuple[int, List[int], int]:
         """source_sheet_idx, column_indices (sorted), dest_sheet_idx or -1 for new sheet."""
         return self._source_idx, list(self._selected_source_cols), self._dest_idx
-
-
-class PrimaryColumnDialog(QDialog):
-    def __init__(self, parent, header_row: List[str]):
-        super().__init__(parent)
-        self.setWindowTitle("Filter by primary column")
-        self._col_idx: Optional[int] = None
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "Choose a column that contains numbers only. "
-                "Rows where that column is empty, zero, or non-numeric will be removed (header row kept)."
-            )
-        )
-        self._combo = QComboBox()
-        for i, h in enumerate(header_row):
-            label = str(h).strip() if h is not None else ""
-            if not label:
-                label = f"Column {i + 1}"
-            self._combo.addItem(label, i)
-        layout.addWidget(self._combo)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._accept_ok)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _accept_ok(self):
-        self._col_idx = self._combo.currentData()
-        self.accept()
-
-    def selected_column_index(self) -> Optional[int]:
-        return self._col_idx
 
 
 class SheetSelectionDialog(QDialog):
@@ -383,3 +357,188 @@ class UpdateExistingExcelDialog(QDialog):
 
     def result(self) -> Optional[dict]:
         return self._result
+
+
+class EventTemplateDialog(QDialog):
+    """Manage saved event-header templates: load, save, edit headers + aliases, delete."""
+
+    def __init__(self, parent, *, current_options: List[str], current_aliases: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Event header templates")
+        self._loaded_options: Optional[List[str]] = None
+        self._loaded_aliases: Optional[dict] = None
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Saved templates:"))
+        picker_row = QHBoxLayout()
+        self._template_combo = QComboBox()
+        self._template_combo.currentIndexChanged.connect(self._on_template_picked)
+        picker_row.addWidget(self._template_combo, 1)
+        new_btn = QPushButton("New")
+        new_btn.setToolTip("Start with the current session's headers (or empty)")
+        new_btn.clicked.connect(self._on_new_clicked)
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self._on_delete_clicked)
+        picker_row.addWidget(new_btn)
+        picker_row.addWidget(delete_btn)
+        layout.addLayout(picker_row)
+
+        layout.addWidget(QLabel(
+            "Headers and their alias keywords (comma-separated). The matcher checks "
+            "if any header-name word OR any alias appears in a transaction's description."
+        ))
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Header name", "Aliases (comma-separated)"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        layout.addWidget(self._table, stretch=1)
+
+        row_btn_row = QHBoxLayout()
+        add_row_btn = QPushButton("Add header")
+        add_row_btn.clicked.connect(self._add_blank_row)
+        del_row_btn = QPushButton("Remove selected")
+        del_row_btn.clicked.connect(self._remove_selected_rows)
+        row_btn_row.addWidget(add_row_btn)
+        row_btn_row.addWidget(del_row_btn)
+        row_btn_row.addStretch()
+        layout.addLayout(row_btn_row)
+
+        action_row = QHBoxLayout()
+        save_btn = QPushButton("Save as…")
+        save_btn.clicked.connect(self._on_save_as)
+        load_btn = QPushButton("Load into session")
+        load_btn.clicked.connect(self._on_load_into_session)
+        cancel_btn = QPushButton("Close")
+        cancel_btn.clicked.connect(self.reject)
+        action_row.addWidget(save_btn)
+        action_row.addWidget(load_btn)
+        action_row.addStretch()
+        action_row.addWidget(cancel_btn)
+        layout.addLayout(action_row)
+
+        self.resize(640, 460)
+        self._reload_template_list(select_name=None)
+        # Pre-fill the editor with the current session's options/aliases
+        self._populate_editor(current_options, current_aliases)
+
+    def _reload_template_list(self, *, select_name: Optional[str]):
+        self._template_combo.blockSignals(True)
+        try:
+            self._template_combo.clear()
+            self._template_combo.addItem("(unsaved)", None)
+            templates = load_all_templates()
+            for t in templates:
+                name = str(t.get("name", "")).strip()
+                if not name:
+                    continue
+                self._template_combo.addItem(name, name)
+            if select_name:
+                idx = self._template_combo.findData(select_name)
+                if idx >= 0:
+                    self._template_combo.setCurrentIndex(idx)
+        finally:
+            self._template_combo.blockSignals(False)
+
+    def _populate_editor(self, options: List[str], aliases: dict):
+        self._table.setRowCount(0)
+        for opt in options:
+            self._add_row(opt, ", ".join(aliases.get(opt, []) or []))
+        if not options:
+            self._add_blank_row()
+
+    def _add_row(self, name: str, aliases_csv: str):
+        r = self._table.rowCount()
+        self._table.insertRow(r)
+        self._table.setItem(r, 0, QTableWidgetItem(str(name or "")))
+        self._table.setItem(r, 1, QTableWidgetItem(str(aliases_csv or "")))
+
+    def _add_blank_row(self):
+        self._add_row("", "")
+
+    def _remove_selected_rows(self):
+        rows = sorted({i.row() for i in self._table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self._table.removeRow(r)
+
+    def _on_template_picked(self, _index: int):
+        name = self._template_combo.currentData()
+        if not name:
+            return
+        for t in load_all_templates():
+            if str(t.get("name", "")).strip() == name:
+                opts, aliases = template_to_session(t)
+                self._populate_editor(opts, aliases)
+                return
+
+    def _on_new_clicked(self):
+        self._template_combo.setCurrentIndex(0)
+        self._table.setRowCount(0)
+        self._add_blank_row()
+
+    def _on_delete_clicked(self):
+        name = self._template_combo.currentData()
+        if not name:
+            QMessageBox.information(self, "Delete template", "Pick a saved template first.")
+            return
+        if QMessageBox.question(
+            self, "Delete template", f"Delete template “{name}”?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        _delete_template(name)
+        self._reload_template_list(select_name=None)
+
+    def _collect_editor_state(self) -> tuple[List[str], dict]:
+        options: List[str] = []
+        aliases: dict = {}
+        for r in range(self._table.rowCount()):
+            name_item = self._table.item(r, 0)
+            alias_item = self._table.item(r, 1)
+            name = (name_item.text() if name_item else "").strip()
+            if not name:
+                continue
+            if name in options:
+                continue
+            options.append(name)
+            alias_csv = alias_item.text() if alias_item else ""
+            alias_list = [a.strip() for a in alias_csv.split(",") if a.strip()]
+            if alias_list:
+                aliases[name] = alias_list
+        return options, aliases
+
+    def _on_save_as(self):
+        options, aliases = self._collect_editor_state()
+        if not options:
+            QMessageBox.warning(self, "Save template", "Add at least one header before saving.")
+            return
+        suggested = self._template_combo.currentData() or ""
+        name, ok = QInputDialog.getText(self, "Save template", "Template name:", text=suggested)
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.warning(self, "Save template", "Template name cannot be empty.")
+            return
+        try:
+            template = session_to_template(name, options, aliases)
+            upsert_template(name, template["headers"])
+        except Exception as e:
+            QMessageBox.critical(self, "Save template", f"Could not save: {e}")
+            return
+        self._reload_template_list(select_name=name)
+
+    def _on_load_into_session(self):
+        options, aliases = self._collect_editor_state()
+        if not options:
+            QMessageBox.warning(self, "Load template", "Add at least one header before loading.")
+            return
+        self._loaded_options = options
+        self._loaded_aliases = aliases
+        self.accept()
+
+    def loaded_session(self) -> Optional[tuple]:
+        """Returns (options, aliases) if 'Load into session' was clicked; else None."""
+        if self._loaded_options is None:
+            return None
+        return self._loaded_options, self._loaded_aliases or {}

@@ -419,53 +419,34 @@ def _parse_rows_after_header(
     return rows
 
 
-def _cells_to_canonical(cells: List[str], columns: List[ColumnDef]) -> List[str]:
-    """Map named columns to 7-field output matching converter.py."""
-    by_name = {columns[i].name: cells[i].strip() if i < len(cells) else "" for i in range(len(columns))}
-
-    date_v = by_name.get("Date", "")
-    desc_v = by_name.get("Description", "")
-    ref_v = by_name.get("Reference", "")
-    vd_v = by_name.get("Value Date", "")
-    deb_v = by_name.get("Debit", "")
-    cred_v = by_name.get("Credit", "")
-    bal_v = by_name.get("Balance", "")
-
-    # Single Amount column -> heuristic
-    if "Amount" in by_name and not deb_v and not cred_v:
-        amt = by_name["Amount"]
-        if amt:
-            deb_v = amt
-
-    return [date_v, desc_v, ref_v, vd_v, deb_v, cred_v, bal_v]
-
-
-def reconstruct_transactions_coordinate(pdf_path: str) -> List[List[str]]:
+def reconstruct_transactions_coordinate(pdf_path: str) -> Tuple[List[str], List[List[str]]]:
     """
-    Extract transactions using word positions. Returns canonical rows:
-    [Transaction Date, Details, Reference, Value Date, Debit, Credit, Balance]
+    Extract transactions using word positions. Returns (headers, rows) preserving
+    detected column names in original order. Empty result if no transaction
+    header could be detected.
     """
     with pdfplumber.open(pdf_path) as pdf:
         words = _words_from_pdf(pdf)
         if not words:
-            return []
+            return [], []
 
         lines = _group_into_lines(words, line_tolerance=3.5)
         hdr = _detect_header(lines)
         if not hdr:
-            return []
+            return [], []
 
         header_idx, columns = hdr
         raw_rows = _parse_rows_after_header(lines, header_idx, columns)
+
+        headers = [col.name for col in columns]
         out: List[List[str]] = []
         for rc in raw_rows:
             if len(rc) < len(columns):
                 rc = rc + [""] * (len(columns) - len(rc))
-            canon = _cells_to_canonical(rc[: len(columns)], columns)
-            canon = [_strip_cell_artifacts(c) for c in canon]
-            if any(c.strip() for c in canon):
-                out.append(canon)
-    return out
+            cells = [_strip_cell_artifacts(c) for c in rc[: len(columns)]]
+            if any(c.strip() for c in cells):
+                out.append(cells)
+    return headers, out
 
 
 def count_probable_transaction_lines_in_text(pdf_path: str) -> int:

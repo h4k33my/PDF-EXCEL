@@ -116,6 +116,97 @@ def apply_event_amount_mapping(
     return out, stats, created
 
 
+def detect_description_column(header_row: List[object]) -> int | None:
+    """Return index of the first column whose header matches description-like keywords."""
+    keywords = (
+        "transaction details",
+        "description",
+        "narration",
+        "particulars",
+        "remarks",
+        "details",
+    )
+    if not header_row:
+        return None
+    for idx, cell in enumerate(header_row):
+        text = str(cell or "").strip().lower()
+        if not text:
+            continue
+        for k in keywords:
+            if k in text:
+                return idx
+    return None
+
+
+def _alias_candidates(option_text: str, aliases: Dict[str, List[str]]) -> List[str]:
+    """Build the lowercase substring candidates for matching one event option."""
+    candidates: List[str] = []
+    for part in str(option_text).split("|"):
+        token = part.strip().lower()
+        if len(token) >= 2:
+            candidates.append(token)
+    for alias in aliases.get(option_text, []) or []:
+        token = str(alias).strip().lower()
+        if len(token) >= 2:
+            candidates.append(token)
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
+def auto_assign_events_by_description(
+    data: List[List[object]],
+    *,
+    event_col_idx: int,
+    description_col_idx: int,
+    options: Iterable[str],
+    aliases: Dict[str, List[str]] | None = None,
+    prefilled_rows: Iterable[int] | None = None,
+) -> Dict[int, str]:
+    """
+    Scan rows; for each row whose event cell is empty (and not prefilled),
+    find the first option whose name parts (split on '|') or aliases appear
+    as case-insensitive substrings of the description. Returns
+    {row_idx: matched_option}. Does NOT modify `data`.
+    """
+    if not data or event_col_idx < 0 or description_col_idx < 0:
+        return {}
+    aliases = aliases or {}
+    prefilled = set(prefilled_rows or [])
+    option_list = [opt for opt in options if str(opt or "").strip()]
+    if not option_list:
+        return {}
+
+    candidates_per_option = [(opt, _alias_candidates(opt, aliases)) for opt in option_list]
+
+    matches: Dict[int, str] = {}
+    for row_idx in range(1, len(data)):
+        if row_idx in prefilled:
+            continue
+        row = data[row_idx]
+        # Skip rows whose event cell already has content.
+        existing = ""
+        if event_col_idx < len(row):
+            existing = str(row[event_col_idx] or "").strip()
+        if existing:
+            continue
+        if description_col_idx >= len(row):
+            continue
+        description = str(row[description_col_idx] or "").strip().lower()
+        if not description:
+            continue
+        for option, tokens in candidates_per_option:
+            if any(tok in description for tok in tokens):
+                matches[row_idx] = option
+                break
+    return matches
+
+
 def to_number(value: object) -> float:
     text = str(value or "").strip()
     if not text:

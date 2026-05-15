@@ -38,7 +38,7 @@ def main():
     
     # Set application properties
     app.setApplicationName('Bank Statement Converter')
-    app.setApplicationVersion('1.1.2')
+    app.setApplicationVersion('1.1.4')
     
     # Create and show main window
     window = MainWindow()
