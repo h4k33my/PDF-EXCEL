@@ -1593,7 +1593,7 @@ class MainWindow(QMainWindow):
 
     def browse_excel(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Excel workbook", "", "Excel Files (*.xlsx)"
+            self, "Select Excel workbook", "", "Excel Files (*.xlsx *.xls *.xlsm)"
         )
         if not file_path:
             return
