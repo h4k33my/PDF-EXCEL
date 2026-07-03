@@ -474,7 +474,7 @@ class MainWindow(QMainWindow):
 
     def initUI(self):
         """Build main UI layout"""
-        self.setWindowTitle("Bank Statement PDF-to-Excel Converter v1.1")
+        self.setWindowTitle("Bank Statement PDF-to-Excel Converter v1.2")
         self.setGeometry(100, 100, 1000, 750)
 
         central_widget = QWidget()
