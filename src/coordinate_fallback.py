@@ -19,11 +19,13 @@ HEADER_ALIASES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"^date$", re.I), "Date"),
     (re.compile(r"^transaction\s+details$", re.I), "Description"),
     (re.compile(r"^transaction\s+description$", re.I), "Description"),
+    (re.compile(r"^transaction\s+remarks?$", re.I), "Description"),
     (re.compile(r"^narration$", re.I), "Description"),
     (re.compile(r"^description$", re.I), "Description"),
     (re.compile(r"^details$", re.I), "Description"),
     (re.compile(r"^particulars$", re.I), "Description"),
     (re.compile(r"^remarks$", re.I), "Description"),
+    (re.compile(r"^cheque\s+number$", re.I), "Reference"),
     (re.compile(r"^debit\s+amount$", re.I), "Debit"),
     (re.compile(r"^debit$", re.I), "Debit"),
     (re.compile(r"^withdrawal(?:s)?$", re.I), "Debit"),
@@ -76,7 +78,8 @@ class PWord:
 
 @dataclass
 class ColumnDef:
-    name: str
+    name: str          # canonical alias used for internal logic (numeric detection etc.)
+    original_name: str  # verbatim phrase from PDF header
     x: float
     right_edge: float
     header_right_x: float
@@ -145,7 +148,7 @@ def _try_extract_columns_from_header_lines(header_lines: List[List[PWord]]) -> L
         for it in line:
             items.append((it, li, False))
 
-    candidates: List[Tuple[str, float, float]] = []
+    candidates: List[Tuple[str, str, float, float]] = []  # (canonical, original, x, hrx)
     used_canonical: set = set()
 
     def mark_used(i: int, j: int) -> None:
@@ -168,12 +171,12 @@ def _try_extract_columns_from_header_lines(header_lines: List[List[PWord]]) -> L
             if uj or lj != li:
                 break
             gap = wj.x - (item.x + item.width)
-            if gap > 20:
+            if gap > 80:
                 break
             phrase = f"{item.text.strip()} {wj.text.strip()}"
             can = _match_header_alias(phrase)
             if can and can not in used_canonical:
-                candidates.append((can, item.x, wj.x + wj.width))
+                candidates.append((can, phrase, item.x, wj.x + wj.width))
                 used_canonical.add(can)
                 mark_used(i, j)
                 matched = True
@@ -195,16 +198,17 @@ def _try_extract_columns_from_header_lines(header_lines: List[List[PWord]]) -> L
                 phrase = f"{item.text.strip()} {wj.text.strip()}"
                 can = _match_header_alias(phrase)
                 if can and can not in used_canonical:
-                    candidates.append((can, item.x, wj.x + wj.width))
+                    candidates.append((can, phrase, item.x, wj.x + wj.width))
                     used_canonical.add(can)
                     items[i] = (item, li, True)
                     items[best_j] = (wj, items[best_j][1], True)
                     matched = True
 
         if not matched:
-            can = _match_header_alias(item.text.strip())
+            single_phrase = item.text.strip()
+            can = _match_header_alias(single_phrase)
             if can and can not in used_canonical:
-                candidates.append((can, item.x, item.x + item.width))
+                candidates.append((can, single_phrase, item.x, item.x + item.width))
                 used_canonical.add(can)
                 items[i] = (item, li, True)
 
@@ -213,13 +217,14 @@ def _try_extract_columns_from_header_lines(header_lines: List[List[PWord]]) -> L
     if len(candidates) < 3:
         return []
 
-    candidates.sort(key=lambda c: c[1])
+    candidates.sort(key=lambda c: c[2])
     cols: List[ColumnDef] = []
-    for idx, (name, x, hrx) in enumerate(candidates):
-        right = candidates[idx + 1][1] if idx + 1 < len(candidates) else float("inf")
+    for idx, (name, original, x, hrx) in enumerate(candidates):
+        right = candidates[idx + 1][2] if idx + 1 < len(candidates) else float("inf")
         cols.append(
             ColumnDef(
                 name=name,
+                original_name=original,
                 x=x,
                 right_edge=right,
                 header_right_x=hrx,
@@ -231,8 +236,9 @@ def _try_extract_columns_from_header_lines(header_lines: List[List[PWord]]) -> L
 
 def _detect_header(lines: List[List[PWord]]) -> Optional[Tuple[int, List[ColumnDef]]]:
     max_scan = min(len(lines), 100)
+    best: Optional[Tuple[int, List[ColumnDef]]] = None
+    best_score = -1
     for start_i in range(max_scan):
-        best: Optional[Tuple[int, List[ColumnDef]]] = None
         for span in range(1, 4):
             if start_i + span > len(lines):
                 break
@@ -240,11 +246,13 @@ def _detect_header(lines: List[List[PWord]]) -> Optional[Tuple[int, List[ColumnD
             cols = _try_extract_columns_from_header_lines(header_lines)
             if len(cols) >= 3:
                 end_idx = start_i + span - 1
-                if best is None or len(cols) > len(best[1]):
+                # Prefer headers that yield actual data rows after them.
+                parsed_rows = _parse_rows_after_header(lines, end_idx, cols)
+                score = len(parsed_rows)
+                if score > best_score or (score == best_score and len(cols) > len(best[1]) if best else True):
                     best = (end_idx, cols)
-        if best is not None:
-            return best
-    return None
+                    best_score = score
+    return best
 
 
 def _assign_line_to_cells(line: List[PWord], columns: List[ColumnDef]) -> List[str]:
@@ -275,7 +283,10 @@ def _assign_line_to_cells(line: List[PWord], columns: List[ColumnDef]) -> List[s
             for i, col in enumerate(columns):
                 col_width = columns[i + 1].x - col.x if i + 1 < len(columns) else 200
                 col_center = col.x + col_width / 2
-                dist = abs(item_center - col_center)
+                # Prefer the column whose left edge the word starts at/near over
+                # pure center distance — fixes first-word-of-description being pulled
+                # into the preceding narrow column when both pass the boundary check.
+                dist = min(abs(item_center - col_center), abs(w.x - col.x))
                 if w.x >= col.x - 15 and (i == len(columns) - 1 or w.x < columns[i + 1].x + 10):
                     if dist < best_dist:
                         best_dist = dist
@@ -365,6 +376,19 @@ def _parse_rows_after_header(
 
     desc_col = next((i for i, c in enumerate(columns) if re.search(r"description|narration|details|particulars", c.name, re.I)), -1)
 
+    # Derive a gap threshold from header word heights so the same logic works in
+    # both PDF-coordinate space (points) and OCR-pixel space.  Any continuation
+    # line that is more than 8× a typical word height below the previous line is
+    # treated as a footer/section break rather than a wrapped description.
+    header_line = lines[header_line_idx] if header_line_idx < len(lines) else []
+    if header_line:
+        avg_word_h = sum(w.height for w in header_line) / len(header_line)
+        _max_continuation_gap = avg_word_h * 8
+    else:
+        _max_continuation_gap = float("inf")
+
+    prev_top: Optional[float] = None
+
     def flush() -> None:
         nonlocal current
         if current is not None:
@@ -374,6 +398,7 @@ def _parse_rows_after_header(
     for i in range(header_line_idx + 1, len(lines)):
         line = lines[i]
         line_str = _line_to_string(line)
+        line_top = line[0].top if line else None
 
         if any(p.search(line_str) for p in SKIP_LINE_PATTERNS):
             bal_m = re.search(r"([\d,]+\.\d{2})\s*$", line_str)
@@ -404,16 +429,27 @@ def _parse_rows_after_header(
             flush()
             current = cells
         elif current is not None and filled <= 2:
-            for ci, val in enumerate(cells):
-                v = val.strip()
-                if not v:
-                    continue
-                if current[ci]:
-                    current[ci] = f"{current[ci]} {v}".strip()
-                else:
-                    current[ci] = v
+            large_gap = (
+                prev_top is not None
+                and line_top is not None
+                and (line_top - prev_top) > _max_continuation_gap
+            )
+            if large_gap:
+                flush()
+            else:
+                for ci, val in enumerate(cells):
+                    v = val.strip()
+                    if not v:
+                        continue
+                    if current[ci]:
+                        current[ci] = f"{current[ci]} {v}".strip()
+                    else:
+                        current[ci] = v
         else:
             flush()
+
+        if line_top is not None:
+            prev_top = line_top
 
     flush()
     return rows
@@ -438,7 +474,7 @@ def reconstruct_transactions_coordinate(pdf_path: str) -> Tuple[List[str], List[
         header_idx, columns = hdr
         raw_rows = _parse_rows_after_header(lines, header_idx, columns)
 
-        headers = [col.name for col in columns]
+        headers = [col.original_name for col in columns]
         out: List[List[str]] = []
         for rc in raw_rows:
             if len(rc) < len(columns):
@@ -494,3 +530,57 @@ def should_use_coordinate_fallback(
         return True
 
     return False
+
+
+def reconstruct_transactions_ocr(pdf_path: str):
+    """
+    Use OCR (pytesseract) on rendered PDF pages to extract word boxes and
+    fall back to the same column-assignment logic. Returns (headers, rows).
+    """
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        return [], []
+
+    words = []
+    try:
+        images = convert_from_path(pdf_path, dpi=200)
+    except Exception:
+        return [], []
+
+    page_no = 0
+    for img in images:
+        page_no += 1
+        # use pytesseract to get word-level boxes
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        n = len(data.get('text', []))
+        for i in range(n):
+            txt = (data['text'][i] or '').strip()
+            if not txt:
+                continue
+            x = float(data['left'][i])
+            w = float(data['width'][i])
+            top = float(data['top'][i])
+            h = float(data['height'][i])
+            words.append(PWord(text=txt, x=x, width=w, height=h, top=top, page=page_no))
+
+    if not words:
+        return [], []
+
+    lines = _group_into_lines(words, line_tolerance=6.0)
+    hdr = _detect_header(lines)
+    if not hdr:
+        return [], []
+    header_idx, columns = hdr
+    raw_rows = _parse_rows_after_header(lines, header_idx, columns)
+    headers = [col.original_name for col in columns]
+    out = []
+    for rc in raw_rows:
+        if len(rc) < len(columns):
+            rc = rc + [""] * (len(columns) - len(rc))
+        cells = [_strip_cell_artifacts(c) for c in rc[: len(columns)]]
+        if any(c.strip() for c in cells):
+            out.append(cells)
+    return headers, out

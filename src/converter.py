@@ -10,7 +10,20 @@ pdfplumber's table extraction yields too little content.
 """
 import re
 import pdfplumber
-from coordinate_fallback import reconstruct_transactions_coordinate, should_use_coordinate_fallback
+try:
+    # when running as `python -c "from src import converter"` the package
+    # context requires relative imports; prefer relative, fall back to top-level.
+    from .coordinate_fallback import (
+        reconstruct_transactions_coordinate,
+        should_use_coordinate_fallback,
+        reconstruct_transactions_ocr,
+    )
+except Exception:
+    from coordinate_fallback import (
+        reconstruct_transactions_coordinate,
+        should_use_coordinate_fallback,
+        reconstruct_transactions_ocr,
+    )
 from openpyxl import Workbook
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -40,6 +53,50 @@ BANK_DETAIL_KEYWORDS = (
     'total debit', 'total credit', 'internal reference', 'iban',
     'account summary', 'short name',
 )
+
+# Field names used to split concatenated bank-summary blobs (UBA and similar portals
+# export the account summary as a single wide text cell rather than a proper table).
+# Sorted longest-first so longer phrases win over any shared prefix.
+_SUMMARY_SPLIT_FIELDS = sorted([
+    'Account Summary', 'Account Number', 'Account Currency', 'Account Nickname',
+    'Account Type', 'Account Name', 'Opening Balance', 'Closing Balance',
+    'Available Balance', 'Usable Balance', 'Statement Period', 'Print Date',
+    'Total Debit', 'Total Credit', 'Withdrawal', 'Deposit', 'Branch', 'IBAN',
+], key=len, reverse=True)
+
+
+def _parse_summary_to_kv_rows(bank_details_rows):
+    """
+    Split concatenated blob text in bank_details into [[Label, Value], ...] rows.
+
+    Nigerian bank portals (e.g. UBA) export the account summary as a single wide
+    text cell. This function uses known field names as split points to recover the
+    original key/value structure. Returns a list of 2-element lists, or None if
+    the rows are already multi-column (caller uses raw rows) or no known field names
+    were found.
+    """
+    if not bank_details_rows:
+        return None
+    # If rows already have proper multi-column structure, leave them alone.
+    # Parsing would risk dropping rows whose label isn't in _SUMMARY_SPLIT_FIELDS.
+    if max(len(r) for r in bank_details_rows) > 1:
+        return None
+    split_pattern = '(' + '|'.join(re.escape(f) for f in _SUMMARY_SPLIT_FIELDS) + ')'
+    kv_rows: list = []
+    for row in bank_details_rows:
+        text = ' '.join(str(c) for c in row if str(c).strip()).strip()
+        if not text:
+            continue
+        parts = re.split(split_pattern, text, flags=re.IGNORECASE)
+        # parts layout: [prefix, field1, value1, field2, value2, ...]
+        i = 1  # skip parts[0] (text before the first known field, usually empty)
+        while i < len(parts) - 1:
+            label = parts[i].strip()
+            value = parts[i + 1].strip().lstrip(':').strip()
+            if label:
+                kv_rows.append([label, value])
+            i += 2
+    return kv_rows if kv_rows else None
 
 
 def clean_cell(cell):
@@ -291,7 +348,7 @@ def _build_generic_table_sheet(table_rows, used_names, index):
         return None
     max_cols = max(len(r) for r in table_rows)
     sheet_data = [r + [''] * (max_cols - len(r)) for r in table_rows]
-    sheet_data = drop_empty_columns(sheet_data)
+    # preserve empty columns by default; caller may drop afterwards
     if not sheet_data:
         return None
     header_row = table_rows[0] if table_rows else []
@@ -322,50 +379,67 @@ def _build_full_text_sheet(pdf_path, used_names):
 
 
 def _build_sheet_from_block(block, used_names, total_blocks):
-    """Combine bank_details + transactions into one verbatim sheet."""
-    sheet_data = []
-    if block['bank_details']:
-        sheet_data.extend(block['bank_details'])
-    if block['transactions']:
-        sheet_data.extend(block['transactions'])
-    if not sheet_data:
-        return None
-    max_cols = max(len(r) for r in sheet_data)
-    sheet_data = [r + [''] * (max_cols - len(r)) for r in sheet_data]
-    sheet_data = drop_empty_columns(sheet_data)
-    if not sheet_data:
-        return None
+    """Return [summary_sheet?, tx_sheet?] — account summary and transactions as separate sheets."""
+    bank_details = block['bank_details']
+    transactions = block['transactions']
+    if not bank_details and not transactions:
+        return []
+
     fallback = 'Statement' if total_blocks == 1 else f"Statement_{len(used_names) + 1}"
-    base = _derive_sheet_name(block['bank_details'], fallback)
-    name = _make_unique_sheet_name(base, used_names)
-    return {'name': name, 'data': sheet_data, 'is_table': True}
+    result = []
+
+    if bank_details:
+        kv_rows = _parse_summary_to_kv_rows(bank_details) or bank_details
+        max_c = max(len(r) for r in kv_rows)
+        summary_data = [r + [''] * (max_c - len(r)) for r in kv_rows]
+        result.append({'name': _make_unique_sheet_name('Summary', used_names),
+                       'data': summary_data, 'is_table': True})
+        name_source = kv_rows  # parsed rows enable proper sheet-name derivation
+    else:
+        name_source = []
+
+    if transactions:
+        max_c = max(len(r) for r in transactions)
+        tx_data = [r + [''] * (max_c - len(r)) for r in transactions]
+        base = _derive_sheet_name(name_source, fallback)
+        result.append({'name': _make_unique_sheet_name(base, used_names),
+                       'data': tx_data, 'is_table': True})
+
+    return result
 
 
 def _coord_fallback_sheet(pdf_path, blocks):
-    """Try coordinate-based extraction; build a single sheet if it yields data."""
+    """Try coordinate-based extraction; return [summary_sheet?, tx_sheet] if it yields data."""
     try:
         coord_headers, coord_rows = reconstruct_transactions_coordinate(pdf_path)
     except Exception:
-        return None
+        return []
     if not coord_rows:
-        return None
-    sheet_data = []
-    # Preserve any bank details from the first detected block
-    if blocks and blocks[0]['bank_details']:
-        sheet_data.extend(blocks[0]['bank_details'])
-    if coord_headers:
-        sheet_data.append(list(coord_headers))
-    sheet_data.extend(coord_rows)
-    max_cols = max(len(r) for r in sheet_data) if sheet_data else 0
-    sheet_data = [r + [''] * (max_cols - len(r)) for r in sheet_data]
-    sheet_data = drop_empty_columns(sheet_data)
-    if not sheet_data:
-        return None
-    base = _derive_sheet_name(blocks[0]['bank_details'] if blocks else [], 'Statement')
-    return {'name': base, 'data': sheet_data, 'is_table': True}
+        return []
+
+    bank_details = blocks[0]['bank_details'] if blocks else []
+    used: set = set()
+    result = []
+
+    if bank_details:
+        kv_rows = _parse_summary_to_kv_rows(bank_details) or bank_details
+        max_c = max(len(r) for r in kv_rows)
+        summary_data = [r + [''] * (max_c - len(r)) for r in kv_rows]
+        result.append({'name': _make_unique_sheet_name('Summary', used),
+                       'data': summary_data, 'is_table': True})
+        name_source = kv_rows
+    else:
+        name_source = []
+
+    tx_data = ([list(coord_headers)] if coord_headers else []) + coord_rows
+    max_c = max(len(r) for r in tx_data) if tx_data else 0
+    tx_data = [r + [''] * (max_c - len(r)) for r in tx_data]
+    base = _derive_sheet_name(name_source, 'Statement')
+    result.append({'name': _make_unique_sheet_name(base, used), 'data': tx_data, 'is_table': True})
+    return result
 
 
-def extract_all_tables_from_pdf(pdf_path):
+def extract_all_tables_from_pdf(pdf_path, preserve_empty_columns=True):
     """
     Extract a bank-statement PDF verbatim. Returns a list of sheets, one per
     detected account block. Preserves original column count and header
@@ -425,19 +499,57 @@ def extract_all_tables_from_pdf(pdf_path):
         or should_use_coordinate_fallback(pdf_path, primary_tx_count)
     )
     if needs_fallback:
-        coord_sheet = _coord_fallback_sheet(pdf_path, blocks)
-        if coord_sheet is not None:
-            return [coord_sheet]
+        # Prefer coordinate reconstruction, but try OCR-based reconstruction first
+        try:
+            hdrs, ocr_rows = reconstruct_transactions_ocr(pdf_path)
+        except Exception:
+            hdrs, ocr_rows = ([], [])
+        if ocr_rows:
+            bank_details = blocks[0]['bank_details'] if blocks else []
+            ocr_used: set = set()
+            result_sheets = []
+
+            # Summary sheet (separate from transactions)
+            if bank_details:
+                kv_rows = _parse_summary_to_kv_rows(bank_details) or bank_details
+                max_c = max(len(r) for r in kv_rows)
+                summary_data = [r + [''] * (max_c - len(r)) for r in kv_rows]
+                result_sheets.append({'name': _make_unique_sheet_name('Summary', ocr_used),
+                                      'data': summary_data, 'is_table': True})
+                name_source = kv_rows
+            else:
+                name_source = []
+
+            # Transactions sheet
+            tx_data = [list(hdrs)] + ocr_rows
+            max_c = max(len(r) for r in tx_data) if tx_data else 0
+            tx_data = [r + [''] * (max_c - len(r)) for r in tx_data]
+            if not preserve_empty_columns:
+                tx_data = drop_empty_columns(tx_data)
+            if tx_data:
+                base = _derive_sheet_name(name_source, 'Statement')
+                result_sheets.append({'name': _make_unique_sheet_name(base, ocr_used),
+                                      'data': tx_data, 'is_table': True})
+
+            if result_sheets:
+                return result_sheets
+
+        coord_sheets = _coord_fallback_sheet(pdf_path, blocks)
+        if coord_sheets:
+            return coord_sheets
 
     sheets = []
     used_names = set()
     for block in blocks:
-        sheet = _build_sheet_from_block(block, used_names, total_blocks=len(blocks))
-        if sheet is not None:
+        for sheet in _build_sheet_from_block(block, used_names, total_blocks=len(blocks)):
+            if not preserve_empty_columns:
+                sheet['data'] = drop_empty_columns(sheet['data'])
             sheets.append(sheet)
     for idx, table in enumerate(other_tables, start=1):
         sheet = _build_generic_table_sheet(table, used_names, idx)
         if sheet is not None:
+            if not preserve_empty_columns:
+                sheet['data'] = drop_empty_columns(sheet['data'])
             sheets.append(sheet)
     # Always add full text sheet if there's any text
     text_sheet = _build_full_text_sheet(pdf_path, used_names)
